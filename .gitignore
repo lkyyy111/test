@@ -1,0 +1,11 @@
+
+/小测试.pdf
+/data/
+
+/ego_video_annotation/outputs/
+__pycache__/
+*.py[cod]
+.venv/
+env/
+.env
+

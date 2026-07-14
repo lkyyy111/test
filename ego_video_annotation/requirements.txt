@@ -1,0 +1,7 @@
+numpy>=1.24
+opencv-python>=4.8
+mediapipe>=0.10.14
+requests>=2.31
+tqdm>=4.66
+# 仅下载 ModelScope 数据集时需要；主标注管线不依赖它。
+modelscope>=1.27
