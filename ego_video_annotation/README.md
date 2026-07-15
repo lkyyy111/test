@@ -1,16 +1,42 @@
 # 第一视角具身操作视频自动标注
 
-该项目对应考核的前三项：多层级视频切分、语言标注、手部姿态和轨迹提取。默认使用 MediaPipe 提取 21 个手部关键点与归一化三维坐标；手部 mesh 与物体 mesh 是后续可选模块。
+该项目完成多层级视频切分、语言标注、手部姿态与轨迹提取。默认使用 MediaPipe 同时检测最多两只手，为每只手输出 21 个关键点、左右手轨迹和逐帧有效性 mask；当前版本不生成 MANO mesh。
 
-## 切分策略
+## 当前切分策略：先细后粗
 
-粗粒度不是简单按镜头变化切分。管线以 8 秒为上下文窗口、4 秒为中心锚点步长，每个窗口向 VLM 发送均匀抽取的 5 帧；标签只描述窗口中心时刻的稳定子任务和受限任务阶段（准备、取放、清洗、切配、烹饪、整理、移动、等待、其他）。相邻中心锚点的语义变化会给出一个 4 秒候选区间；该区间再以 1 秒级多帧 VLM 复核，要求新阶段连续出现后才确认边界，最后向附近的手部停顿或明显视觉变化微调。若 VLM 不可用或语义窗口响应成功率低于 60%，才退化为画面变化候选切分，并将该状态写入结果和复核队列。
+管线不再用画面变化作为动作边界，也不再先生成粗粒度窗口。当前顺序是：
 
-细粒度切分仅在每个粗粒度子任务内部进行，依据局部手腕运动与画面变化生成动作级候选边界；每个细片段都带有 `parent_coarse_id`。这样可避免厨房第一视角视频中“场景没变、任务已变”或“相机晃动、任务未变”造成的错误层级。
+1. 默认以约 8 FPS 读取真实时间戳，检测左右手 21 点。
+2. 使用背景 LK 光流、RANSAC 仿射变换估计相邻采样帧的相机运动，并从掌心位移中扣除相机运动。
+3. 左右手分别计算并平滑掌心速度；在前后 0.75 秒参考窗口内寻找显著局部极小值。
+4. 候选速度谷默认要求前后相对下降均不低于 40%，归一化 prominence 不低于 0.20，且前后确实存在运动。
+5. 左右手在 0.4 秒内的候选融合为一个边界；单手候选也可保留。
+6. 候选边界先产生较高召回率的临时细片段。每段最多均匀取 16 帧交给 VLM，获得固定 JSON caption。
+7. 相邻片段若是同一操作手、同一动作和同一物体，则删除中间运动边界，合并为最终细粒度片段。连续切割、清洗、擦拭和搅拌不会按每次往返作为最终动作。
+8. VLM最后只根据按时间排列的最终细粒度 JSON，将连续 fine id 归纳为粗粒度任务。
 
-## 服务器环境
+画面变化只保留为诊断字段和相机补偿的 fallback 判断，不参与动作边界打分。
 
-建议在 Ubuntu 22.04 + NVIDIA RTX 4090（24 GB）上运行。当前基础管线不强依赖 PyTorch，便于先稳定产出；后续接入 HaMeR、SAM 2 时再在同一个环境安装 PyTorch/CUDA。
+## 手部缺失与有效视频
+
+输出同时保留：
+
+- `hand_present_raw`：采样帧确实检测到至少一只手；
+- `hand_validity.left/right.observed`：对应手确实检测到；
+- `smoothed_presence`：只桥接默认不超过 0.5 秒的短暂缺失；
+- `interpolated_presence`：只代表活动状态被桥接，不会虚构 21 点；
+- `valid_for_boundary`：该帧能否用于速度边界判断。
+
+手部缺失不会被当成速度为零。双手长时间不可见时，管线会增加技术性隔离边界，将无手区间从可导出的动作片段中分开；这类边界不是语义动作边界，也不会参与相邻语义合并。
+
+`valid_segments/` 只按最终细粒度边界导出满足以下条件的片段：
+
+- 平滑手部覆盖率默认不低于 30%；
+- 双手连续不可见默认不超过 1 秒；
+- 至少有两个真实手部采样点；
+- 片段时长默认不低于 0.5 秒。
+
+## 环境
 
 ```bash
 conda create -n egoanno python=3.10 -y
@@ -18,42 +44,54 @@ conda activate egoanno
 pip install -r requirements.txt
 ```
 
-## 下载考核数据
-
-在仓库根目录执行；默认下载 PDF 中给出的 `ly985211/egodata` 数据集到 `data/egodata`。
-
-```bash
-python scripts/download_egodata.py
-```
-
-如下载速度不稳定，可在服务器上配置 ModelScope 镜像或重复运行该命令，下载器会复用已完成的文件。
+当前基础管线不依赖 PyTorch；MediaPipe 和 OpenCV 可在 CPU 上运行，外部 VLM API 不占用本地显存。
 
 ## 运行
 
 ```bash
-python run_pipeline.py --video /path/to/long1.mp4 --output outputs/long1
+python run_pipeline.py \
+  --video ../data/long1.mp4 \
+  --output outputs/long1 \
+  --vlm-api-base "$VLM_API_BASE" \
+  --vlm-model "$VLM_MODEL"
 ```
 
-如需让视觉语言模型生成中文描述，设置 API 密钥并提供兼容 Chat Completions 的接口：
+API 密钥从 `VLM_API_KEY` 环境变量读取。未配置 API 时仍会生成手部、轨迹、运动边界和固定回退 JSON，但不会执行 VLM 语义合并。
+
+常用参数：
 
 ```bash
-export VLM_API_KEY='...'
-python run_pipeline.py --video /path/to/long1.mp4 --output outputs/long1 \
-  --vlm-api-base https://your-api.example/v1 --vlm-model your-vlm-model
+--sample-fps 8
+--velocity-context-s 0.75
+--velocity-drop-ratio 0.40
+--velocity-prominence 0.20
+--fine-frame-count 16
+--hand-gap-tolerance 0.5
+--max-no-hand-gap-s 1.0
+--min-hand-coverage 0.30
 ```
 
-默认不调用 API；此时会输出固定模式的回退 JSON，方便验证其它结果。调用 API 时，每个细片段会向 VLM 提供按时间顺序排列的起始、中间、结束三帧，并要求只输出固定 JSON。低于 `--review-confidence`（默认 0.65）、包含未知动作/物体或 API 异常的片段，都会写入 `annotations.json` 的 `review_queue`，便于人工复核。
+先做不生成视频的烟雾测试：
 
-第一视角视频中手会因遮挡或移出视野而短暂消失。管线会保留每帧真实的 `hand_present_raw`，并仅对前后均检测到手的短缺口（默认不超过 1.5 秒）生成 `hand_present_smoothed`。手的出现/消失本身不会作为语义切分边界；有效片段以平滑后的手部覆盖率筛选，同时保留原始覆盖率与桥接比例，避免把短暂出画误当作操作结束。
+```bash
+python run_pipeline.py \
+  --video ../data/short1.mp4 \
+  --output outputs/short1_smoke \
+  --vlm-api-base "$VLM_API_BASE" \
+  --vlm-model "$VLM_MODEL" \
+  --skip-video-outputs
+```
 
 ## 输出
 
-* `annotations.json`：粗/细粒度分段、有效片段、固定 JSON 语言标注、低置信度复核队列、质量和方法元数据。
-* `hand_landmarks.json`：逐采样帧的 2D/归一化 3D 手部关键点与手腕轨迹。
-* `wrist_trajectories.csv`：便于后续 retarget 的左右手腕轨迹。
-* `hand_overlay.mp4`：手部骨架叠加可视化。
-* `valid_segments/`：保留的有效操作片段。
+- `annotations.json`：速度候选、被语义合并删除的边界、最终粗/细粒度片段、有效片段和复核队列。
+- `hand_landmarks.json`：每个采样时刻的左右手 21 点、有效性 mask、相机补偿质量和速度。
+- `wrist_trajectories.csv`：每个采样时刻固定输出左右手各一行；缺失手的 `valid_mask=false`、坐标为空，不会伪造轨迹点。
+- `hand_overlay.mp4`：采样帧的手部骨架叠加。
+- `valid_segments/`：按最终细粒度片段导出的有效操作视频。
 
-## 坐标说明与局限
+相邻片段使用半开时间区间 `[start_s, end_s)`，因此不会再因为最后一个采样时间而固定漏掉一段视频。
 
-MediaPipe 的 `x, y` 是相对图像宽高归一化坐标；`z` 是相对深度而非相机标定后的绝对深度。它足以描述视频内手部姿态和轨迹。若需要精确米制轨迹或 MANO mesh，下一阶段会用 HaMeR 与相机/尺度对齐模块替换或补充本模块。
+## 坐标局限
+
+MediaPipe 的 `x/y` 是图像归一化坐标，`z` 是相对深度；CSV 中 `world_x/y/z` 仍是 MediaPipe 的相对手部坐标，不是经过相机标定的米制世界坐标。当前速度使用背景仿射运动补偿后的二维掌心位移，适合本次轻量测试，但不等价于 VITRA 的完整世界坐标轨迹。
