@@ -468,13 +468,18 @@ def vlm_annotation(frames: list[np.ndarray], segment: dict[str, Any], api_base: 
     prompt = (
         "你是严谨的第一视角具身操作视频标注员。必须按用户给定 JSON 模式回答。"
     )
-    body = {"model": model, "temperature": 0.1, "max_tokens": 180, "messages": [
+    body = {"model": model, "temperature": 0.1, "max_tokens": 512, "messages": [
         {"role": "system", "content": prompt}, {"role": "user", "content": content},
     ]}
     try:
         response = requests.post(api_base.rstrip("/") + "/chat/completions", headers={"Authorization": f"Bearer {key}"}, json=body, timeout=90)
         response.raise_for_status()
-        raw = parse_json_response(response.json()["choices"][0]["message"]["content"])
+        raw_content = response.json()["choices"][0]["message"]["content"]
+        raw = parse_json_response(raw_content)
+        if raw is None:
+            annotation = fallback_annotation(segment, "VLM 响应不是 JSON 对象")
+            annotation["raw_response"] = str(raw_content)[:4000]
+            return annotation
         return normalize_annotation(raw, segment)
     except (requests.RequestException, KeyError, IndexError, TypeError) as error:
         print(f"[warning] VLM 标注失败，改用回退 JSON：{error}")
@@ -522,7 +527,7 @@ def vlm_boundary_labels(
             {"type": "text", "text": f"第 {index} 帧，时间 {times[index - 1]:.2f}s"},
             {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(encoded.tobytes()).decode("ascii")}},
         ])
-    body = {"model": model, "temperature": 0.0, "max_tokens": 300, "messages": [
+    body = {"model": model, "temperature": 0.0, "max_tokens": 512, "messages": [
         {"role": "system", "content": "你是严谨的视频时序标注员。必须严格输出给定 JSON 模式。"},
         {"role": "user", "content": content},
     ]}
