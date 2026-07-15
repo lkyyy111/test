@@ -13,12 +13,40 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from egoanno.pipeline import (  # noqa: E402
     _long_no_hand_boundaries,
+    HandIdentityTracker,
     compatible_fine_annotations,
     consolidate_boundaries,
     find_velocity_candidates,
     segment_record,
     spans_from_boundaries,
 )
+
+
+def detected_hand(side: str, x: float, score: float = 0.9) -> dict:
+    return {
+        "raw_side": side,
+        "score": score,
+        "landmarks_2d_relative": [{"x": x, "y": 0.5, "z": 0.0} for _ in range(21)],
+        "landmarks_3d_relative": None,
+    }
+
+
+class HandIdentityTests(unittest.TestCase):
+    def test_non_finite_detection_is_dropped_instead_of_crashing(self) -> None:
+        tracker = HandIdentityTracker()
+        assigned = tracker.assign([detected_hand("left", float("nan"))], 1.0)
+        self.assertEqual(assigned, [])
+
+    def test_unexpected_extra_detection_is_capped_at_two(self) -> None:
+        tracker = HandIdentityTracker()
+        hands = [
+            detected_hand("left", 0.2, 0.9),
+            detected_hand("right", 0.8, 0.8),
+            detected_hand("unknown", 0.5, 0.1),
+        ]
+        assigned = tracker.assign(hands, 1.0)
+        self.assertEqual(len(assigned), 2)
+        self.assertEqual({hand["side"] for hand in assigned}, {"left", "right"})
 
 
 def args() -> Namespace:

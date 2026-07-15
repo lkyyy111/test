@@ -61,29 +61,51 @@ class HandTracker:
             min_detection_confidence=confidence,
             min_tracking_confidence=confidence,
         )
+        self.last_invalid_count = 0
 
     @staticmethod
     def _points(landmarks: Any) -> list[dict[str, float]]:
         return [{"x": float(p.x), "y": float(p.y), "z": float(p.z)} for p in landmarks.landmark]
 
+    @staticmethod
+    def _valid_points(points: list[dict[str, float]]) -> bool:
+        return len(points) == 21 and all(
+            math.isfinite(point[axis]) for point in points for axis in ("x", "y", "z")
+        )
+
     def process(self, frame_bgr: np.ndarray) -> list[dict[str, Any]]:
+        self.last_invalid_count = 0
         result = self.hands.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
         if not result.multi_hand_landmarks:
             return []
-        world = result.multi_hand_world_landmarks or [None] * len(result.multi_hand_landmarks)
-        handedness = result.multi_handedness or [None] * len(result.multi_hand_landmarks)
+        count = len(result.multi_hand_landmarks)
+        world = list(result.multi_hand_world_landmarks or [])
+        handedness = list(result.multi_handedness or [])
+        world.extend([None] * (count - len(world)))
+        handedness.extend([None] * (count - len(handedness)))
         detected: list[dict[str, Any]] = []
         for landmarks, world_landmarks, label_data in zip(result.multi_hand_landmarks, world, handedness):
+            points_2d = self._points(landmarks)
+            if not self._valid_points(points_2d):
+                self.last_invalid_count += 1
+                continue
+            points_3d = self._points(world_landmarks) if world_landmarks else None
+            if points_3d is not None and not self._valid_points(points_3d):
+                points_3d = None
             label, score = "unknown", 0.0
             if label_data and label_data.classification:
                 label = label_data.classification[0].label.lower()
                 score = float(label_data.classification[0].score)
+            if label not in HAND_SIDES:
+                label = "unknown"
+            if not math.isfinite(score):
+                score = 0.0
             detected.append({
                 "raw_side": label,
                 "side": label,
                 "score": round(score, 4),
-                "landmarks_2d_relative": self._points(landmarks),
-                "landmarks_3d_relative": self._points(world_landmarks) if world_landmarks else None,
+                "landmarks_2d_relative": points_2d,
+                "landmarks_3d_relative": points_3d,
             })
         return detected
 
@@ -106,7 +128,19 @@ class HandIdentityTracker:
     def assign(self, hands: list[dict[str, Any]], time_s: float) -> list[dict[str, Any]]:
         if not hands:
             return hands
-        centers = [palm_center(hand) for hand in hands]
+        valid_hands_and_centers = []
+        for hand in hands:
+            center = palm_center(hand)
+            if center.shape == (2,) and np.all(np.isfinite(center)):
+                valid_hands_and_centers.append((hand, center))
+        # MediaPipe is configured for two hands, but cap defensively in case a
+        # backend returns malformed extra detections.
+        valid_hands_and_centers.sort(key=lambda item: float(item[0].get("score", 0.0)), reverse=True)
+        valid_hands_and_centers = valid_hands_and_centers[:len(HAND_SIDES)]
+        if not valid_hands_and_centers:
+            return []
+        hands = [item[0] for item in valid_hands_and_centers]
+        centers = [item[1] for item in valid_hands_and_centers]
         assignments = itertools.permutations(HAND_SIDES, len(hands))
         best_slots: tuple[str, ...] | None = None
         best_cost = float("inf")
@@ -115,6 +149,8 @@ class HandIdentityTracker:
             for hand, center, slot in zip(hands, centers, slots):
                 raw_side = hand.get("raw_side", "unknown")
                 raw_score = float(hand.get("score", 0.0))
+                if not math.isfinite(raw_score):
+                    raw_score = 0.0
                 if raw_side in HAND_SIDES and raw_side != slot:
                     cost += 0.25 * max(0.5, raw_score)
                 previous = self.last.get(slot)
@@ -122,9 +158,19 @@ class HandIdentityTracker:
                     cost += float(np.linalg.norm(center - previous[0]))
                 elif raw_side not in HAND_SIDES:
                     cost += 0.1
-            if cost < best_cost:
+            if math.isfinite(cost) and cost < best_cost:
                 best_cost, best_slots = cost, slots
-        assert best_slots is not None
+        if best_slots is None:
+            # This should only be reachable for unexpected backend values. Keep
+            # the pipeline alive with a deterministic raw-label-first mapping.
+            available = list(HAND_SIDES)
+            fallback: list[str] = []
+            for hand in hands:
+                raw_side = hand.get("raw_side")
+                slot = raw_side if raw_side in available else available[0]
+                fallback.append(slot)
+                available.remove(slot)
+            best_slots = tuple(fallback)
         for hand, center, slot in zip(hands, centers, best_slots):
             hand["side"] = slot
             hand["track_id"] = slot
@@ -241,6 +287,7 @@ def sample_and_track(info: VideoInfo, sample_fps: float, confidence: float) -> l
                         "camera_motion_from_previous": [[round(float(v), 7) for v in row] for row in affine],
                         "camera_motion_quality": round(camera_quality, 4),
                         "camera_feature_count": feature_count,
+                        "invalid_hand_detection_count": tracker.last_invalid_count,
                         "hand_present_raw": bool(hands),
                         "hands": hands,
                     })
