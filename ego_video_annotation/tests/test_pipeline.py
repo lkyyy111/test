@@ -18,6 +18,7 @@ from egoanno.pipeline import (  # noqa: E402
     HandIdentityTracker,
     annotate_hand_validity,
     attach_hand_motion,
+    build_clean_annotations,
     compatible_fine_annotations,
     consolidate_boundaries,
     find_velocity_candidates,
@@ -208,6 +209,63 @@ class FineAnnotationSchemaTests(unittest.TestCase):
             {"hand_coverage": 1.0},
         )
         self.assertNotIn("coarse_stage", annotation)
+
+    @staticmethod
+    def segment(segment_id: str, **overrides: object) -> dict:
+        result = {
+            "id": segment_id,
+            "start_s": 1.25,
+            "end_s": 3.75,
+            "duration_s": 2.5,
+            "sample_start": 10,
+            "sample_end": 29,
+            "hand_coverage": 0.9,
+            "valid_operation": True,
+            "needs_review": False,
+            "caption_zh": "拿起杯子：右手拿起杯子",
+            "semantic_annotation": {
+                "annotation_source": "vlm",
+                "meaningful_action": True,
+                "subtask": "拿起杯子",
+                "action": {"verb": "拿起", "description": "右手拿起杯子"},
+                "objects": ["杯子"],
+                "left_hand": {"visible": False, "action": "无", "object": "无"},
+                "right_hand": {"visible": True, "action": "拿起", "object": "杯子"},
+                "confidence": 0.9,
+            },
+        }
+        result.update(overrides)
+        return result
+
+    def test_clean_annotations_keep_only_reviewed_vlm_actions(self) -> None:
+        accepted = self.segment("fine_001")
+        rejected_review = self.segment("fine_002", needs_review=True)
+        rejected_invalid = self.segment("fine_003", valid_operation=False)
+        fallback = self.segment("fine_004")
+        fallback["semantic_annotation"] = {
+            **fallback["semantic_annotation"], "annotation_source": "fallback",
+        }
+        info = VideoInfo("/dataset/long1.mp4", 50.0, 15000, 1920, 1080, 300.0)
+
+        payload = build_clean_annotations(
+            info, [accepted, rejected_review, rejected_invalid, fallback], clips_exported=True,
+        )
+
+        self.assertEqual(payload["schema_version"], "1.0")
+        self.assertEqual(payload["video"]["file"], "long1.mp4")
+        self.assertEqual(payload["hand_data_file"], "hand_landmarks.json")
+        self.assertEqual(len(payload["clips"]), 1)
+        clip = payload["clips"][0]
+        self.assertEqual(clip["id"], "fine_001")
+        self.assertEqual(clip["clip_path"], "valid_segments/fine_001_1.2-3.8s.mp4")
+        self.assertEqual(clip["sample_range"], {"start": 10, "end": 29})
+        self.assertEqual(set(clip["hands"]), {"left", "right"})
+        self.assertNotIn("semantic_key", clip)
+
+    def test_smoke_output_uses_null_clip_path(self) -> None:
+        info = VideoInfo("short1.mp4", 30.0, 300, 640, 480, 10.0)
+        payload = build_clean_annotations(info, [self.segment("fine_001")], clips_exported=False)
+        self.assertIsNone(payload["clips"][0]["clip_path"])
 
 
 class MergedRecaptionTests(unittest.TestCase):

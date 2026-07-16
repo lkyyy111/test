@@ -4,6 +4,7 @@
 
 /ego_video_annotation/outputs/
 annotations.json
+annotations_diagnostics.json
 hand_landmarks.json
 hand_overlay.mp4
 __pycache__/

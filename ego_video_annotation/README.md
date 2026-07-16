@@ -92,13 +92,15 @@ python run_pipeline.py \
 
 ## 输出
 
-- `annotations.json`：速度候选、被语义合并删除的边界、最终细粒度片段、长片段重描述、有效片段和复核队列。
+- `annotations.json`：面向训练/交付的干净细粒度标注。仅保留手部有效、VLM 成功、动作有意义且无需复核的片段，包含时间、视频路径、caption、动作、物体、左右手信息、质量分数及 `hand_landmarks.json` 采样范围。
+- `annotations_diagnostics.json`：完整运行诊断，包括参数、候选与删除边界、全部有效/无效细片段、合并与重描述历史以及复核队列。
 - `hand_landmarks.json`：每个采样时刻的左右手 21 点、有效性 mask、相机补偿质量和速度。
 - `wrist_trajectories.csv`：每个采样时刻固定输出左右手各一行；缺失手的真实坐标为空，并另外记录边界专用掌心、`motion_source`、权重和插值 mask。
 - `hand_overlay.mp4`：采样帧的手部骨架叠加。
 - `valid_segments/`：按最终细粒度片段导出的有效操作视频。
 
 相邻片段使用半开时间区间 `[start_s, end_s)`，因此不会再因为最后一个采样时间而固定漏掉一段视频。
+`annotations.json` 中的 `sample_range.end` 是包含式索引；使用 `--skip-video-outputs` 时不会生成片段视频，对应 `clip_path` 为 `null`。
 
 ## 坐标局限
 

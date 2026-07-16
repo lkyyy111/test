@@ -1399,6 +1399,68 @@ def review_reasons(annotation: dict[str, Any], threshold: float) -> list[str]:
     return reasons
 
 
+def clip_filename(segment: dict[str, Any]) -> str:
+    return f"{segment['id']}_{segment['start_s']:.1f}-{segment['end_s']:.1f}s.mp4"
+
+
+def build_clean_annotations(
+    info: VideoInfo, fine: list[dict[str, Any]], clips_exported: bool,
+) -> dict[str, Any]:
+    """Build the compact, training-facing annotation file from reviewed fine clips."""
+    clips: list[dict[str, Any]] = []
+    for segment in fine:
+        annotation = segment["semantic_annotation"]
+        if not (
+            segment["valid_operation"]
+            and annotation.get("annotation_source") == "vlm"
+            and annotation.get("meaningful_action", False)
+            and not segment.get("needs_review", False)
+        ):
+            continue
+        hands = {
+            output_side: {
+                "visible": bool(annotation[annotation_side].get("visible", False)),
+                "action": str(annotation[annotation_side].get("action") or "未知"),
+                "object": str(annotation[annotation_side].get("object") or "未知物体"),
+            }
+            for output_side, annotation_side in (("left", "left_hand"), ("right", "right_hand"))
+        }
+        clips.append({
+            "id": segment["id"],
+            "clip_path": f"valid_segments/{clip_filename(segment)}" if clips_exported else None,
+            "start_s": segment["start_s"],
+            "end_s": segment["end_s"],
+            "duration_s": segment["duration_s"],
+            "sample_range": {
+                "start": segment["sample_start"],
+                "end": segment["sample_end"],
+            },
+            "caption": segment["caption_zh"],
+            "subtask": annotation["subtask"],
+            "action": {
+                "verb": annotation["action"]["verb"],
+                "description": annotation["action"]["description"],
+            },
+            "objects": annotation["objects"],
+            "hands": hands,
+            "quality": {
+                "hand_coverage": segment["hand_coverage"],
+                "vlm_confidence": annotation["confidence"],
+            },
+        })
+    return {
+        "schema_version": "1.0",
+        "video": {
+            "id": Path(info.path).stem,
+            "file": Path(info.path).name,
+            "fps": info.fps,
+            "duration_s": info.duration_s,
+        },
+        "hand_data_file": "hand_landmarks.json",
+        "clips": clips,
+    }
+
+
 def write_trajectories(samples: list[dict[str, Any]], output: Path) -> None:
     fields = [
         "time_s", "frame_index", "side", "valid_mask", "x", "y", "z",
@@ -1474,7 +1536,7 @@ def write_valid_clips(info: VideoInfo, segments: list[dict[str, Any]], output_di
             start_frame = max(0, int(math.floor(segment["start_s"] * info.fps)))
             end_frame = min(info.frame_count, int(math.ceil(segment["end_s"] * info.fps)))
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-            target = output_dir / f"{segment['id']}_{segment['start_s']:.1f}-{segment['end_s']:.1f}s.mp4"
+            target = output_dir / clip_filename(segment)
             writer = cv2.VideoWriter(
                 str(target), cv2.VideoWriter_fourcc(*"mp4v"), info.fps, (info.width, info.height),
             )
@@ -1572,7 +1634,7 @@ def run(args: argparse.Namespace) -> None:
         segment for segment in annotation_attempts
         if segment["semantic_annotation"]["annotation_source"] == "vlm"
     ]
-    payload = {
+    diagnostics = {
         "schema_version": "0.6",
         "video": asdict(info),
         "parameters": vars(args),
@@ -1604,7 +1666,13 @@ def run(args: argparse.Namespace) -> None:
         "valid_segments": valid_ids,
         "review_queue": review_queue,
     }
-    (output / "annotations.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    clean_annotations = build_clean_annotations(info, fine, clips_exported=not args.skip_video_outputs)
+    (output / "annotations.json").write_text(
+        json.dumps(clean_annotations, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    (output / "annotations_diagnostics.json").write_text(
+        json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
     (output / "hand_landmarks.json").write_text(json.dumps(samples, ensure_ascii=False, indent=2), encoding="utf-8")
     write_trajectories(samples, output / "wrist_trajectories.csv")
     if not args.skip_video_outputs:
@@ -1612,7 +1680,10 @@ def run(args: argparse.Namespace) -> None:
         write_overlay(info, samples, output / "hand_overlay.mp4")
         print("[info] 按最终细粒度边界导出有效操作片段…")
         write_valid_clips(info, fine, output / "valid_segments")
-    print(f"[done] 最终细片段：{len(fine)}；有效视频：{len(valid_ids)}；待复核：{len(review_queue)}；结果目录：{output}")
+    print(
+        f"[done] 最终细片段：{len(fine)}；干净标注：{len(clean_annotations['clips'])}；"
+        f"有效视频：{len(valid_ids)}；待复核：{len(review_queue)}；结果目录：{output}"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
