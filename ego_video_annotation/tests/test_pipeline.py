@@ -14,9 +14,12 @@ sys.path.insert(0, str(ROOT / "src"))
 from egoanno.pipeline import (  # noqa: E402
     _long_no_hand_boundaries,
     HandIdentityTracker,
+    annotate_hand_validity,
+    attach_hand_motion,
     compatible_fine_annotations,
     consolidate_boundaries,
     find_velocity_candidates,
+    _refinement_indices,
     segment_record,
     spans_from_boundaries,
 )
@@ -25,6 +28,7 @@ from egoanno.pipeline import (  # noqa: E402
 def detected_hand(side: str, x: float, score: float = 0.9) -> dict:
     return {
         "raw_side": side,
+        "side": side,
         "score": score,
         "landmarks_2d_relative": [{"x": x, "y": 0.5, "z": 0.0} for _ in range(21)],
         "landmarks_3d_relative": None,
@@ -58,6 +62,8 @@ def args() -> Namespace:
         velocity_prominence=0.20,
         velocity_min_gap_s=0.80,
         hand_boundary_fusion_s=0.40,
+        velocity_min_window_weight=0.60,
+        motion_interpolation_gap_s=0.50,
     )
 
 
@@ -125,6 +131,46 @@ class VelocityBoundaryTests(unittest.TestCase):
             for index, span in enumerate(spans_from_boundaries(boundaries, len(samples)))
         ]
         self.assertEqual([item["valid_operation"] for item in records], [True, False, True])
+
+    def test_short_gap_is_interpolated_only_for_motion(self) -> None:
+        samples = []
+        for index in range(8):
+            hands = [] if index in (2, 3) else [detected_hand("left", 0.2 + 0.01 * index)]
+            samples.append({
+                "time_s": index / 8.0,
+                "hands": hands,
+                "camera_motion_quality": 1.0,
+                "scene_change_diagnostic": 0.0,
+                "camera_motion_from_previous": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            })
+        annotate_hand_validity(samples, 0.5)
+        attach_hand_motion(samples, 0.15, 0.25, 0.5, 0.25)
+        missing_track = samples[2]["hand_tracks"]["left"]
+        self.assertFalse(missing_track["valid_mask"])
+        self.assertIsNone(missing_track["landmarks_2d_relative"])
+        self.assertTrue(missing_track["interpolated_for_motion"])
+        self.assertIsNotNone(missing_track["boundary_palm_center"])
+        self.assertEqual(samples[3]["hand_motion"]["left"]["source"], "interpolated_for_motion")
+
+    def test_vlm_suggested_frame_aligns_to_nearby_weak_valley(self) -> None:
+        speed = [0.10] * 6 + [0.08, 0.04, 0.01, 0.04, 0.08] + [0.10] * 7
+        samples = motion_samples(speed)
+        segment = {
+            "sample_start": 0,
+            "sample_end": len(samples) - 1,
+            "start_s": 0.0,
+            "end_s": len(samples) / 8.0,
+            "vlm_frame_times_s": [0.0, 0.5, 1.0, 1.5],
+            "semantic_annotation": {"suggested_boundary_frames": [3]},
+        }
+        config = args()
+        config.minimum_provisional_duration_s = 0.5
+        config.max_vlm_refinement_splits = 2
+        config.vlm_refinement_search_s = 1.0
+        selected = _refinement_indices(samples, segment, config)
+        self.assertEqual(len(selected), 1)
+        self.assertAlmostEqual(selected[0]["time_s"], 1.0, places=3)
+        self.assertTrue(selected[0]["aligned_to_weak_velocity_minimum"])
 
 
 class SemanticMergeTests(unittest.TestCase):

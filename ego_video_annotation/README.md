@@ -8,12 +8,13 @@
 
 1. 默认以约 8 FPS 读取真实时间戳，检测左右手 21 点。
 2. 使用背景 LK 光流、RANSAC 仿射变换估计相邻采样帧的相机运动，并从掌心位移中扣除相机运动。
-3. 左右手分别计算并平滑掌心速度；在前后 0.75 秒参考窗口内寻找显著局部极小值。
-4. 候选速度谷默认要求前后相对下降均不低于 40%，归一化 prominence 不低于 0.20，且前后确实存在运动。
-5. 左右手在 0.4 秒内的候选融合为一个边界；单手候选也可保留。
-6. 候选边界先产生较高召回率的临时细片段。每段最多均匀取 16 帧交给 VLM，获得固定 JSON caption。
-7. 相邻片段若是同一操作手、同一动作和同一物体，则删除中间运动边界，合并为最终细粒度片段。连续切割、清洗、擦拭和搅拌不会按每次往返作为最终动作。
-8. VLM最后只根据按时间排列的最终细粒度 JSON，将连续 fine id 归纳为粗粒度任务。
+3. 对不超过 0.5 秒且前后身份连续的短丢手，仅补全相机补偿后的边界专用掌心轨迹；21 点与 `valid_mask` 仍保持缺失，不把插值当成真实观测。
+4. 左右手分别计算并平滑掌心速度，并构造取当前活跃手最大归一化速度的全局活动曲线；在前后 0.75 秒加权窗口内寻找局部极小值。
+5. 真实速度点权重为 1，插值速度点权重为 0.4；默认速度谷下降不低于 25%，prominence 不低于 0.10，窗口加权覆盖率不低于 0.60。左右手及全局候选在 0.4 秒内融合。
+6. 候选边界先产生偏高召回率的临时细片段；最长分析窗默认 8 秒，每段最多均匀取 16 帧交给 VLM，获得固定 JSON caption。
+7. 若 VLM 判断候选包含多个动作，它会返回动作序列和建议帧号；管线在建议时间附近对齐弱腕速谷，最多补切 2 个边界，并重新描述子片段。
+8. 相邻片段若是同一操作手、同一动作和同一物体，则删除中间运动边界，合并为最终细粒度片段。连续切割、清洗、擦拭和搅拌不会按每次往返作为最终动作。
+9. VLM最后只根据按时间排列的最终细粒度 JSON，将连续 fine id 归纳为粗粒度任务；无手无效区间保持为技术间隔。
 
 画面变化只保留为诊断字段和相机补偿的 fallback 判断，不参与动作边界打分。
 
@@ -26,6 +27,8 @@
 - `smoothed_presence`：只桥接默认不超过 0.5 秒的短暂缺失；
 - `interpolated_presence`：只代表活动状态被桥接，不会虚构 21 点；
 - `valid_for_boundary`：该帧能否用于速度边界判断。
+- `hand_tracks.left/right.boundary_palm_center`：真实或短缺失补全的边界专用掌心位置；
+- `interpolated_for_motion`：该边界专用掌心是否来自低权重插值，`true` 时 `valid_mask` 仍为 `false`。
 
 手部缺失不会被当成速度为零。双手长时间不可见时，管线会增加技术性隔离边界，将无手区间从可导出的动作片段中分开；这类边界不是语义动作边界，也不会参与相邻语义合并。
 
@@ -63,8 +66,12 @@ API 密钥从 `VLM_API_KEY` 环境变量读取。未配置 API 时仍会生成�
 ```bash
 --sample-fps 8
 --velocity-context-s 0.75
---velocity-drop-ratio 0.40
---velocity-prominence 0.20
+--velocity-drop-ratio 0.25
+--velocity-prominence 0.10
+--velocity-min-gap-s 0.60
+--velocity-min-window-weight 0.60
+--motion-interpolation-gap-s 0.5
+--max-provisional-segment-s 8
 --fine-frame-count 16
 --hand-gap-tolerance 0.5
 --max-no-hand-gap-s 1.0
@@ -86,7 +93,7 @@ python run_pipeline.py \
 
 - `annotations.json`：速度候选、被语义合并删除的边界、最终粗/细粒度片段、有效片段和复核队列。
 - `hand_landmarks.json`：每个采样时刻的左右手 21 点、有效性 mask、相机补偿质量和速度。
-- `wrist_trajectories.csv`：每个采样时刻固定输出左右手各一行；缺失手的 `valid_mask=false`、坐标为空，不会伪造轨迹点。
+- `wrist_trajectories.csv`：每个采样时刻固定输出左右手各一行；缺失手的真实坐标为空，并另外记录边界专用掌心、`motion_source`、权重和插值 mask。
 - `hand_overlay.mp4`：采样帧的手部骨架叠加。
 - `valid_segments/`：按最终细粒度片段导出的有效操作视频。
 

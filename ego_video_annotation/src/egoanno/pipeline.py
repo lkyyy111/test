@@ -388,35 +388,132 @@ def _smooth_finite_runs(values: np.ndarray, times: np.ndarray, radius_s: float) 
     return result
 
 
-def attach_hand_motion(samples: list[dict[str, Any]], min_camera_quality: float, smoothing_radius_s: float) -> None:
-    """Compute camera-compensated palm speed for both hands."""
+def _camera_step_usable(sample: dict[str, Any], min_camera_quality: float) -> bool:
+    quality = float(sample["camera_motion_quality"])
+    low_scene_change = float(sample["scene_change_diagnostic"]) <= 0.025
+    return quality >= min_camera_quality or low_scene_change
+
+
+def _apply_affine(affine: np.ndarray, point: np.ndarray) -> np.ndarray:
+    return affine @ np.array([point[0], point[1], 1.0], dtype=np.float64)
+
+
+def _boundary_centers(
+    samples: list[dict[str, Any]], side: str, min_camera_quality: float,
+    max_gap_s: float, max_displacement: float,
+) -> tuple[list[np.ndarray | None], list[str | None], np.ndarray]:
+    """Bridge short palm gaps only for motion analysis, never as real pose observations."""
+    width, height = CAMERA_MOTION_SIZE
+    diagonal = math.hypot(width, height)
+    times = np.array([sample["time_s"] for sample in samples], dtype=np.float64)
+    centers: list[np.ndarray | None] = []
+    sources: list[str | None] = []
+    weights = np.zeros(len(samples), dtype=np.float64)
+    for sample in samples:
+        hand = _hand_for_side(sample, side)
+        if hand is None:
+            centers.append(None)
+            sources.append(None)
+        else:
+            centers.append(palm_center(hand) * np.array([width, height], dtype=np.float64))
+            sources.append("observed")
+            weights[len(centers) - 1] = 1.0
+
+    index = 0
+    while index < len(samples):
+        if centers[index] is not None:
+            index += 1
+            continue
+        gap_start = index
+        while index < len(samples) and centers[index] is None:
+            index += 1
+        gap_end = index
+        left, right = gap_start - 1, gap_end
+        if left < 0 or right >= len(samples) or times[right] - times[left] > max_gap_s:
+            continue
+        if not all(_camera_step_usable(samples[i], min_camera_quality) for i in range(left + 1, right + 1)):
+            continue
+
+        forward: dict[int, np.ndarray] = {left: centers[left].copy()}  # type: ignore[union-attr]
+        for i in range(left + 1, right + 1):
+            affine = np.asarray(samples[i]["camera_motion_from_previous"], dtype=np.float64)
+            forward[i] = _apply_affine(affine, forward[i - 1])
+        residual = float(np.linalg.norm(centers[right] - forward[right]) / diagonal)  # type: ignore[operator]
+        if residual > max_displacement:
+            continue
+
+        backward: dict[int, np.ndarray] = {right: centers[right].copy()}  # type: ignore[union-attr]
+        invertible = True
+        for i in range(right - 1, left, -1):
+            affine = np.vstack([
+                np.asarray(samples[i + 1]["camera_motion_from_previous"], dtype=np.float64),
+                [0.0, 0.0, 1.0],
+            ])
+            try:
+                inverse = np.linalg.inv(affine)[:2]
+            except np.linalg.LinAlgError:
+                invertible = False
+                break
+            backward[i] = _apply_affine(inverse, backward[i + 1])
+        if not invertible:
+            continue
+        for i in range(gap_start, gap_end):
+            alpha = float((times[i] - times[left]) / max(times[right] - times[left], 1e-6))
+            centers[i] = (1.0 - alpha) * forward[i] + alpha * backward[i]
+            sources[i] = "interpolated_for_motion"
+            weights[i] = 0.4
+    return centers, sources, weights
+
+
+def attach_hand_motion(
+    samples: list[dict[str, Any]], min_camera_quality: float, smoothing_radius_s: float,
+    interpolation_gap_s: float, interpolation_max_displacement: float,
+) -> None:
+    """Compute camera-compensated palm speed with low-weight short-gap bridging."""
     width, height = CAMERA_MOTION_SIZE
     diagonal = math.hypot(width, height)
     times = np.array([sample["time_s"] for sample in samples], dtype=np.float64)
     for sample in samples:
         sample["hand_motion"] = {
-            side: {"raw_speed": None, "smoothed_speed": None, "valid": False} for side in HAND_SIDES
+            side: {
+                "raw_speed": None, "smoothed_speed": None, "valid": False,
+                "source": None, "weight": 0.0,
+            } for side in HAND_SIDES
         }
     for side in HAND_SIDES:
+        centers, center_sources, center_weights = _boundary_centers(
+            samples, side, min_camera_quality, interpolation_gap_s,
+            interpolation_max_displacement,
+        )
         raw = np.full(len(samples), np.nan, dtype=np.float64)
+        speed_weights = np.zeros(len(samples), dtype=np.float64)
+        speed_sources: list[str | None] = [None] * len(samples)
+        for index, sample in enumerate(samples):
+            track = sample["hand_tracks"][side]
+            center = centers[index]
+            track["boundary_palm_center"] = (
+                {
+                    "x": round(float(center[0] / width), 6),
+                    "y": round(float(center[1] / height), 6),
+                } if center is not None else None
+            )
+            track["interpolated_for_motion"] = center_sources[index] == "interpolated_for_motion"
+            track["boundary_motion_available"] = center is not None
         for index in range(1, len(samples)):
-            previous_hand = _hand_for_side(samples[index - 1], side)
-            current_hand = _hand_for_side(samples[index], side)
-            if previous_hand is None or current_hand is None:
+            previous_center, current_center = centers[index - 1], centers[index]
+            if previous_center is None or current_center is None:
                 continue
             dt = times[index] - times[index - 1]
-            if dt <= 0:
-                continue
-            quality = float(samples[index]["camera_motion_quality"])
-            # When the image itself barely changes, identity is a safe camera model.
-            low_scene_change = float(samples[index]["scene_change_diagnostic"]) <= 0.025
-            if quality < min_camera_quality and not low_scene_change:
+            if dt <= 0 or not _camera_step_usable(samples[index], min_camera_quality):
                 continue
             affine = np.asarray(samples[index]["camera_motion_from_previous"], dtype=np.float64)
-            previous_center = palm_center(previous_hand) * np.array([width, height])
-            current_center = palm_center(current_hand) * np.array([width, height])
-            predicted = affine @ np.array([previous_center[0], previous_center[1], 1.0])
+            predicted = _apply_affine(affine, previous_center)
             raw[index] = float(np.linalg.norm(current_center - predicted) / diagonal / dt)
+            speed_weights[index] = min(center_weights[index - 1], center_weights[index])
+            speed_sources[index] = (
+                "observed" if center_sources[index - 1] == center_sources[index] == "observed"
+                else "interpolated_for_motion"
+            )
         smoothed = _smooth_finite_runs(raw, times, smoothing_radius_s)
         for index, sample in enumerate(samples):
             item = sample["hand_motion"][side]
@@ -425,11 +522,117 @@ def attach_hand_motion(samples: list[dict[str, Any]], min_camera_quality: float,
             if np.isfinite(smoothed[index]):
                 item["smoothed_speed"] = round(float(smoothed[index]), 7)
                 item["valid"] = True
+                item["source"] = speed_sources[index]
+                item["weight"] = round(float(speed_weights[index]), 3)
+
+
+def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    order = np.argsort(values)
+    ordered_values, ordered_weights = values[order], weights[order]
+    cutoff = float(np.sum(ordered_weights)) / 2.0
+    return float(ordered_values[min(int(np.searchsorted(np.cumsum(ordered_weights), cutoff)), len(values) - 1)])
+
+
+def _series_velocity_candidates(
+    samples: list[dict[str, Any]], args: argparse.Namespace, label: str,
+    speeds: np.ndarray, weights: np.ndarray, observed: np.ndarray,
+    hands_at_index: list[list[str]], source: str,
+) -> list[dict[str, Any]]:
+    times = np.array([sample["time_s"] for sample in samples], dtype=np.float64)
+    finite_values = speeds[np.isfinite(speeds)]
+    if len(finite_values) < 6:
+        return []
+    q10, q90 = np.percentile(finite_values, [10, 90])
+    speed_range = max(float(q90 - q10), 1e-6)
+    move_threshold = float(q10 + 0.30 * speed_range)
+    candidates: list[dict[str, Any]] = []
+    for index in range(1, len(samples) - 1):
+        if not np.isfinite(speeds[index]) or weights[index] <= 0:
+            continue
+        center = np.where(np.abs(times - times[index]) <= args.velocity_center_s)[0]
+        left = np.where(
+            (times >= times[index] - args.velocity_context_s)
+            & (times <= times[index] - args.velocity_center_s)
+        )[0]
+        right = np.where(
+            (times >= times[index] + args.velocity_center_s)
+            & (times <= times[index] + args.velocity_context_s)
+        )[0]
+
+        def window(indices: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+            keep = np.isfinite(speeds[indices]) & (weights[indices] > 0)
+            values, value_weights = speeds[indices][keep], weights[indices][keep]
+            coverage = float(np.sum(value_weights) / max(1, len(indices)))
+            return values, value_weights, coverage
+
+        center_values, _, center_coverage = window(center)
+        left_values, left_weights, left_coverage = window(left)
+        right_values, right_weights, right_coverage = window(right)
+        if (
+            len(center_values) == 0
+            or len(left_values) == 0
+            or len(right_values) == 0
+            or min(left_coverage, right_coverage) < args.velocity_min_window_weight
+        ):
+            continue
+        support_s = args.motion_interpolation_gap_s
+        real_before = np.any(observed & (times >= times[index] - support_s) & (times <= times[index]))
+        real_after = np.any(observed & (times >= times[index]) & (times <= times[index] + support_s))
+        if not real_before or not real_after:
+            continue
+        valley = float(np.min(center_values))
+        if speeds[index] > valley + 1e-10:
+            continue
+        before = _weighted_median(left_values, left_weights)
+        after = _weighted_median(right_values, right_weights)
+        drop_before = max(0.0, (before - valley) / max(before, 1e-6))
+        drop_after = max(0.0, (after - valley) / max(after, 1e-6))
+        prominence = max(0.0, (min(before, after) - valley) / speed_range)
+        if before <= move_threshold or after <= move_threshold:
+            continue
+        if min(drop_before, drop_after) < args.velocity_drop_ratio:
+            continue
+        if prominence < args.velocity_prominence:
+            continue
+        support_weight = min(left_coverage, right_coverage, max(center_coverage, weights[index]))
+        shape_score = 0.5 * min(drop_before, drop_after) + 0.5 * min(prominence / 0.5, 1.0)
+        score = shape_score * (0.7 + 0.3 * support_weight)
+        candidates.append({
+            "index": index,
+            "time_s": round(float(times[index]), 6),
+            "hands": hands_at_index[index],
+            "source": source,
+            "score": round(float(score), 4),
+            "hard_boundary": False,
+            "evidence": [{
+                "hand": label,
+                "speed_before": round(before, 7),
+                "speed_minimum": round(valley, 7),
+                "speed_after": round(after, 7),
+                "drop_before": round(drop_before, 4),
+                "drop_after": round(drop_after, 4),
+                "normalized_prominence": round(prominence, 4),
+                "move_threshold": round(move_threshold, 7),
+                "left_window_weight": round(left_coverage, 3),
+                "right_window_weight": round(right_coverage, 3),
+                "center_window_weight": round(center_coverage, 3),
+                "motion_source": "interpolated_supported" if weights[index] < 1.0 else "observed",
+                "camera_motion_quality": samples[index]["camera_motion_quality"],
+            }],
+        })
+    retained: list[dict[str, Any]] = []
+    for candidate in sorted(candidates, key=lambda item: item["time_s"]):
+        if not retained or candidate["time_s"] - retained[-1]["time_s"] >= args.velocity_min_gap_s:
+            retained.append(candidate)
+        elif candidate["score"] > retained[-1]["score"]:
+            retained[-1] = candidate
+    return retained
 
 
 def find_velocity_candidates(samples: list[dict[str, Any]], args: argparse.Namespace) -> list[dict[str, Any]]:
-    """Find significant per-hand local speed valleys, then fuse nearby hands."""
-    times = np.array([sample["time_s"] for sample in samples], dtype=np.float64)
+    """Find weighted per-hand and global activity valleys, then fuse nearby proposals."""
+    series: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    hands_for_side = {side: [[side] for _ in samples] for side in HAND_SIDES}
     all_candidates: list[dict[str, Any]] = []
     for side in HAND_SIDES:
         speeds = np.array([
@@ -437,74 +640,46 @@ def find_velocity_candidates(samples: list[dict[str, Any]], args: argparse.Names
             if sample["hand_motion"][side]["smoothed_speed"] is not None else np.nan
             for sample in samples
         ], dtype=np.float64)
-        finite_values = speeds[np.isfinite(speeds)]
-        if len(finite_values) < 6:
-            continue
-        q10, q90 = np.percentile(finite_values, [10, 90])
-        speed_range = max(float(q90 - q10), 1e-6)
-        move_threshold = float(q10 + 0.35 * speed_range)
-        candidates: list[dict[str, Any]] = []
-        for index in range(1, len(samples) - 1):
-            if not np.isfinite(speeds[index]):
-                continue
-            center = np.where(np.abs(times - times[index]) <= args.velocity_center_s)[0]
-            left = np.where(
-                (times >= times[index] - args.velocity_context_s)
-                & (times <= times[index] - args.velocity_center_s)
-            )[0]
-            right = np.where(
-                (times >= times[index] + args.velocity_center_s)
-                & (times <= times[index] + args.velocity_context_s)
-            )[0]
-            center_values = speeds[center][np.isfinite(speeds[center])]
-            left_values = speeds[left][np.isfinite(speeds[left])]
-            right_values = speeds[right][np.isfinite(speeds[right])]
-            expected = max(2, int(round((args.velocity_context_s - args.velocity_center_s) * args.sample_fps * 0.6)))
-            if len(center_values) == 0 or len(left_values) < expected or len(right_values) < expected:
-                continue
-            valley = float(np.min(center_values))
-            if speeds[index] > valley + 1e-10:
-                continue
-            before, after = float(np.median(left_values)), float(np.median(right_values))
-            drop_before = max(0.0, (before - valley) / max(before, 1e-6))
-            drop_after = max(0.0, (after - valley) / max(after, 1e-6))
-            prominence = max(0.0, (min(before, after) - valley) / speed_range)
-            if before <= move_threshold or after <= move_threshold:
-                continue
-            if min(drop_before, drop_after) < args.velocity_drop_ratio:
-                continue
-            if prominence < args.velocity_prominence:
-                continue
-            score = 0.5 * min(drop_before, drop_after) + 0.5 * min(prominence / 0.5, 1.0)
-            candidates.append({
-                "index": index,
-                "time_s": round(float(times[index]), 6),
-                "hands": [side],
-                "source": "camera_compensated_wrist_speed_minimum",
-                "score": round(float(score), 4),
-                "hard_boundary": False,
-                "evidence": [{
-                    "hand": side,
-                    "speed_before": round(before, 7),
-                    "speed_minimum": round(valley, 7),
-                    "speed_after": round(after, 7),
-                    "drop_before": round(drop_before, 4),
-                    "drop_after": round(drop_after, 4),
-                    "normalized_prominence": round(prominence, 4),
-                    "move_threshold": round(move_threshold, 7),
-                    "camera_motion_quality": samples[index]["camera_motion_quality"],
-                }],
-            })
-        # Non-maximum suppression in time for one hand.
-        retained_for_side: list[dict[str, Any]] = []
-        for candidate in sorted(candidates, key=lambda item: item["time_s"]):
-            if not retained_for_side or candidate["time_s"] - retained_for_side[-1]["time_s"] >= args.velocity_min_gap_s:
-                retained_for_side.append(candidate)
-            elif candidate["score"] > retained_for_side[-1]["score"]:
-                retained_for_side[-1] = candidate
-        all_candidates.extend(retained_for_side)
+        weights = np.array([
+            float(sample["hand_motion"][side].get("weight", 1.0 if np.isfinite(speeds[index]) else 0.0))
+            for index, sample in enumerate(samples)
+        ], dtype=np.float64)
+        observed = np.array([
+            bool(sample.get("hand_validity", {}).get(side, {}).get("observed", np.isfinite(speeds[index])))
+            for index, sample in enumerate(samples)
+        ], dtype=bool)
+        series[side] = (speeds, weights, observed)
+        all_candidates.extend(_series_velocity_candidates(
+            samples, args, side, speeds, weights, observed, hands_for_side[side],
+            "camera_compensated_wrist_speed_minimum",
+        ))
 
-    # Fuse left/right candidates that describe the same pause.
+    normalized: dict[str, np.ndarray] = {}
+    for side, (speeds, _, _) in series.items():
+        finite = speeds[np.isfinite(speeds)]
+        scale_low, scale_high = np.percentile(finite, [10, 90]) if len(finite) >= 6 else (0.0, 1.0)
+        # Keep values below the 10th percentile distinct; clipping them to zero
+        # would create an artificial flat valley and shift a boundary earlier.
+        normalized[side] = (speeds - scale_low) / max(float(scale_high - scale_low), 1e-6)
+    global_speed = np.full(len(samples), np.nan, dtype=np.float64)
+    global_weight = np.zeros(len(samples), dtype=np.float64)
+    global_observed = np.zeros(len(samples), dtype=bool)
+    global_hands: list[list[str]] = []
+    for index in range(len(samples)):
+        available = [side for side in HAND_SIDES if np.isfinite(normalized[side][index])]
+        global_hands.append(available)
+        if not available:
+            continue
+        active = max(available, key=lambda side: normalized[side][index])
+        global_speed[index] = normalized[active][index]
+        global_weight[index] = series[active][1][index]
+        global_observed[index] = any(series[side][2][index] for side in available)
+    all_candidates.extend(_series_velocity_candidates(
+        samples, args, "global_activity", global_speed, global_weight, global_observed,
+        global_hands, "camera_compensated_global_activity_minimum",
+    ))
+
+    # Fuse per-hand/global candidates that describe the same pause.
     fused: list[dict[str, Any]] = []
     pending = sorted(all_candidates, key=lambda item: item["time_s"])
     while pending:
@@ -701,6 +876,8 @@ def fallback_annotation(segment: dict[str, Any], reason: str = "未配置或未�
         "temporal_evidence": "未获得可靠的视觉语言标注。",
         "meaningful_action": bool(coverage >= 0.30),
         "contains_multiple_actions": False,
+        "action_sequence": [],
+        "suggested_boundary_frames": [],
         "confidence": 0.0,
         "annotation_source": "fallback",
         "failure_reason": reason,
@@ -739,6 +916,34 @@ def normalize_annotation(raw: Any, segment: dict[str, Any]) -> dict[str, Any]:
     semantic_key = str(raw.get("semantic_key") or "").strip()
     if not semantic_key:
         semantic_key = f"左:{left['action']}:{left['object']}|右:{right['action']}:{right['object']}"
+    action_sequence = raw.get("action_sequence")
+    if not isinstance(action_sequence, list):
+        action_sequence = []
+    normalized_sequence = []
+    for item in action_sequence:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start_frame = int(item.get("start_frame", 1))
+            end_frame = int(item.get("end_frame", start_frame))
+        except (TypeError, ValueError):
+            continue
+        normalized_sequence.append({
+            "action": str(item.get("action") or "未知").strip(),
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+        })
+    boundary_frames = raw.get("suggested_boundary_frames")
+    if not isinstance(boundary_frames, list):
+        boundary_frames = []
+    normalized_boundaries = []
+    for item in boundary_frames:
+        try:
+            frame_number = int(item)
+        except (TypeError, ValueError):
+            continue
+        if frame_number >= 2:
+            normalized_boundaries.append(frame_number)
     return {
         "scene": str(raw.get("scene") or "未知").strip(),
         "coarse_stage": stage,
@@ -754,6 +959,8 @@ def normalize_annotation(raw: Any, segment: dict[str, Any]) -> dict[str, Any]:
         "temporal_evidence": str(raw.get("temporal_evidence") or "未提供").strip(),
         "meaningful_action": bool(raw.get("meaningful_action", True)),
         "contains_multiple_actions": bool(raw.get("contains_multiple_actions", False)),
+        "action_sequence": normalized_sequence,
+        "suggested_boundary_frames": sorted(set(normalized_boundaries)),
         "confidence": round(float(np.clip(confidence, 0.0, 1.0)), 3),
         "annotation_source": "vlm",
     }
@@ -813,9 +1020,14 @@ def vlm_annotation(
         '  "temporal_evidence":"从首尾和中间帧看到的变化",\n'
         '  "meaningful_action":true,\n'
         '  "contains_multiple_actions":false,\n'
+        '  "action_sequence":[{"action":"动作名称","start_frame":1,"end_frame":8}],\n'
+        '  "suggested_boundary_frames":[],\n'
         '  "confidence":0.0\n'
         "}\n"
-        "不要猜测不可见信息；不确定时写未知并降低 confidence。"
+        "若整段只有一个连续语义动作，contains_multiple_actions=false 且 suggested_boundary_frames=[]。"
+        "若包含多个依次发生的动作，contains_multiple_actions=true，并用 action_sequence 描述各动作覆盖的帧号；"
+        "suggested_boundary_frames 填写新动作开始的帧号（2 到总帧数之间的整数）。"
+        "不要把连续切割/清洗的每次往返当成多个动作。不要猜测不可见信息；不确定时写未知并降低 confidence。"
     )}]
     for index, (frame, time_s) in enumerate(zip(frames, frame_times), 1):
         resized = _resize_for_vlm(frame, image_max_side)
@@ -883,6 +1095,184 @@ def sample_segment_frames(
     return [item[0] for item in valid], [item[1] for item in valid]
 
 
+def annotate_candidate_segment(
+    segment: dict[str, Any], info: VideoInfo, args: argparse.Namespace,
+) -> None:
+    if segment["hand_coverage"] < args.min_hand_coverage:
+        annotation = fallback_annotation(segment, "手部长时间不可见，跳过 VLM 标注")
+        annotation["annotation_source"] = "skipped_no_hand"
+        frame_times: list[float] = []
+    else:
+        frames, frame_times = sample_segment_frames(info, segment, args.fine_frame_count)
+        annotation = (
+            vlm_annotation(
+                frames, frame_times, segment, args.vlm_api_base, args.vlm_model,
+                args.vlm_image_max_side,
+            ) if frames else fallback_annotation(segment, "无法读取候选片段帧")
+        )
+    segment["vlm_frame_times_s"] = [round(time_s, 3) for time_s in frame_times]
+    segment["semantic_annotation"] = annotation
+    segment["caption_zh"] = annotation_caption(annotation)
+
+
+def _weak_velocity_minima(
+    samples: list[dict[str, Any]], segment: dict[str, Any], args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    """Rank sub-threshold local minima for aligning a VLM-requested refinement."""
+    times = np.array([sample["time_s"] for sample in samples], dtype=np.float64)
+    start = segment["sample_start"]
+    end = segment["sample_end"] + 1
+    result: list[dict[str, Any]] = []
+    for side in HAND_SIDES:
+        speeds = np.array([
+            sample["hand_motion"][side]["smoothed_speed"]
+            if sample["hand_motion"][side]["smoothed_speed"] is not None else np.nan
+            for sample in samples
+        ], dtype=np.float64)
+        finite = speeds[start:end][np.isfinite(speeds[start:end])]
+        if len(finite) < 4:
+            continue
+        q10, q90 = np.percentile(finite, [10, 90])
+        scale = max(float(q90 - q10), 1e-6)
+        for index in range(start + 1, end - 1):
+            time_s = times[index]
+            if (
+                time_s - segment["start_s"] < args.minimum_provisional_duration_s
+                or segment["end_s"] - time_s < args.minimum_provisional_duration_s
+                or not np.isfinite(speeds[index])
+            ):
+                continue
+            center = np.where((np.abs(times - time_s) <= args.velocity_center_s) & (np.arange(len(samples)) >= start) & (np.arange(len(samples)) < end))[0]
+            left = np.where((times >= time_s - args.velocity_context_s) & (times < time_s) & (np.arange(len(samples)) >= start))[0]
+            right = np.where((times > time_s) & (times <= time_s + args.velocity_context_s) & (np.arange(len(samples)) < end))[0]
+            center_values = speeds[center][np.isfinite(speeds[center])]
+            left_values = speeds[left][np.isfinite(speeds[left])]
+            right_values = speeds[right][np.isfinite(speeds[right])]
+            if not len(center_values) or not len(left_values) or not len(right_values):
+                continue
+            valley = float(np.min(center_values))
+            if speeds[index] > valley + 1e-10:
+                continue
+            prominence = max(0.0, (min(float(np.median(left_values)), float(np.median(right_values))) - valley) / scale)
+            motion_weight = float(samples[index]["hand_motion"][side].get("weight", 0.0))
+            result.append({
+                "index": index,
+                "time_s": float(time_s),
+                "hand": side,
+                "score": prominence + 0.1 * motion_weight,
+                "prominence": prominence,
+            })
+    return result
+
+
+def _refinement_indices(
+    samples: list[dict[str, Any]], segment: dict[str, Any], args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    annotation = segment["semantic_annotation"]
+    frame_times = segment.get("vlm_frame_times_s", [])
+    suggested = annotation.get("suggested_boundary_frames", [])
+    targets = [
+        frame_times[frame_number - 1]
+        for frame_number in suggested
+        if 2 <= frame_number <= len(frame_times)
+    ]
+    if not targets:
+        targets = [(segment["start_s"] + segment["end_s"]) / 2.0]
+    weak = _weak_velocity_minima(samples, segment, args)
+    selected: list[dict[str, Any]] = []
+    for target in targets[:args.max_vlm_refinement_splits]:
+        nearby = [
+            item for item in weak
+            if abs(item["time_s"] - target) <= args.vlm_refinement_search_s
+        ]
+        if nearby:
+            choice = max(
+                nearby,
+                key=lambda item: item["score"]
+                - 0.25 * abs(item["time_s"] - target) / max(args.vlm_refinement_search_s, 1e-6),
+            )
+            candidate = {
+                **choice,
+                "target_time_s": round(float(target), 3),
+                "aligned_to_weak_velocity_minimum": True,
+            }
+        else:
+            allowable = [
+                index for index in range(segment["sample_start"] + 1, segment["sample_end"] + 1)
+                if samples[index]["time_s"] - segment["start_s"] >= args.minimum_provisional_duration_s
+                and segment["end_s"] - samples[index]["time_s"] >= args.minimum_provisional_duration_s
+            ]
+            if not allowable:
+                continue
+            index = min(allowable, key=lambda item: abs(samples[item]["time_s"] - target))
+            candidate = {
+                "index": index,
+                "time_s": float(samples[index]["time_s"]),
+                "hand": "vlm_only",
+                "score": 0.0,
+                "prominence": 0.0,
+                "target_time_s": round(float(target), 3),
+                "aligned_to_weak_velocity_minimum": False,
+            }
+        if any(abs(candidate["time_s"] - item["time_s"]) < args.minimum_provisional_duration_s for item in selected):
+            continue
+        selected.append(candidate)
+    return sorted(selected, key=lambda item: item["index"])
+
+
+def refine_multi_action_segments(
+    provisional: list[dict[str, Any]], samples: list[dict[str, Any]],
+    info: VideoInfo, args: argparse.Namespace,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Split each VLM-flagged multi-action candidate once, then caption its children."""
+    refined: list[dict[str, Any]] = []
+    added_boundaries: list[dict[str, Any]] = []
+    refined_parent_count = 0
+    multi_count = sum(
+        segment["semantic_annotation"].get("annotation_source") == "vlm"
+        and segment["semantic_annotation"].get("contains_multiple_actions")
+        for segment in provisional
+    )
+    if multi_count:
+        print(f"[info] VLM 标记 {multi_count} 个多动作候选，正在自动补切并重新描述子片段…")
+    for segment in provisional:
+        annotation = segment["semantic_annotation"]
+        if annotation.get("annotation_source") != "vlm" or not annotation.get("contains_multiple_actions"):
+            refined.append(segment)
+            continue
+        choices = _refinement_indices(samples, segment, args)
+        indices = [choice["index"] for choice in choices]
+        starts = [segment["sample_start"]] + indices
+        ends = indices + [segment["sample_end"] + 1]
+        if not indices or any(end <= start for start, end in zip(starts, ends)):
+            refined.append(segment)
+            continue
+        refined_parent_count += 1
+        for choice in choices:
+            added_boundaries.append({
+                "index": choice["index"],
+                "time_s": round(float(choice["time_s"]), 6),
+                "hands": [] if choice["hand"] == "vlm_only" else [choice["hand"]],
+                "source": "vlm_multi_action_refinement",
+                "score": round(float(annotation.get("confidence", 0.0)), 4),
+                "hard_boundary": False,
+                "evidence": [{
+                    "parent_segment_id": segment["id"],
+                    "vlm_target_time_s": choice["target_time_s"],
+                    "aligned_to_weak_velocity_minimum": choice["aligned_to_weak_velocity_minimum"],
+                    "weak_velocity_prominence": round(float(choice["prominence"]), 4),
+                }],
+            })
+        for start, end in zip(starts, ends):
+            child = segment_record((start, end), samples, len(refined) + 1, "candidate_fine", info.duration_s, args)
+            child["refined_from"] = segment["id"]
+            annotate_candidate_segment(child, info, args)
+            refined.append(child)
+    for index, segment in enumerate(refined, 1):
+        segment["id"] = f"candidate_fine_{index:03d}"
+    return refined, added_boundaries, refined_parent_count
+
+
 def _norm_text(value: str) -> str:
     return re.sub(r"[\s，。；、,:：;（）()]+", "", value.lower())
 
@@ -941,6 +1331,9 @@ def merge_fine_segments(
         record["semantic_annotation"] = best["semantic_annotation"]
         record["caption_zh"] = annotation_caption(record["semantic_annotation"])
         record["merged_from"] = [item["id"] for item in group]
+        record["refined_from"] = sorted({
+            item["refined_from"] for item in group if item.get("refined_from")
+        })
         record["segmentation_method"] = "velocity_minima_then_vlm_semantic_merge"
         final.append(record)
     return final, removed
@@ -950,8 +1343,24 @@ def _fallback_coarse_groups(fine: list[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: list[dict[str, Any]] = []
     for segment in fine:
         annotation = segment["semantic_annotation"]
+        if not segment["valid_operation"]:
+            if groups and groups[-1]["annotation_source"] == "technical_no_hand_gap":
+                groups[-1]["fine_ids"].append(segment["id"])
+            else:
+                groups.append({
+                    "fine_ids": [segment["id"]],
+                    "coarse_stage": "其他",
+                    "task": "无有效手部操作",
+                    "description": "技术性无手区间，不作为粗粒度操作任务。",
+                    "confidence": 1.0,
+                    "annotation_source": "technical_no_hand_gap",
+                })
+            continue
         stage = annotation["coarse_stage"]
-        if groups and groups[-1]["coarse_stage"] == stage and stage != "其他":
+        if (
+            groups and groups[-1]["annotation_source"] == "fine_label_fallback"
+            and groups[-1]["coarse_stage"] == stage and stage != "其他"
+        ):
             groups[-1]["fine_ids"].append(segment["id"])
         else:
             groups.append({
@@ -983,6 +1392,7 @@ def summarize_coarse_from_fine(
     prompt = (
         "下面是一个第一视角视频按时间排序的最终细粒度动作 JSON。请把相邻动作归纳成粗粒度任务。"
         "只能组合连续 fine id；必须按顺序覆盖每个 fine id 恰好一次；不能修改时间或编造 id。"
+        "valid_operation=false 的片段必须单独作为无有效手部操作的技术间隔，不能与前后任务合并。"
         "只输出合法 JSON："
         '{"groups":[{"fine_ids":["fine_001"],"coarse_stage":"准备|取放|清洗|切配|烹饪|整理|移动|等待|其他",'
         '"task":"粗任务名","description":"由这些细动作归纳的任务描述","confidence":0.0}]}\n'
@@ -999,7 +1409,12 @@ def summarize_coarse_from_fine(
         )
         response.raise_for_status()
         raw = parse_json_response(response.json()["choices"][0]["message"]["content"])
-        raw_groups = raw.get("groups") if isinstance(raw, dict) else None
+        raw_groups = raw if isinstance(raw, list) else None
+        if isinstance(raw, dict):
+            for key_name in ("groups", "coarse_groups", "task_groups", "segments"):
+                if isinstance(raw.get(key_name), list):
+                    raw_groups = raw[key_name]
+                    break
         if not isinstance(raw_groups, list):
             raise ValueError("粗粒度响应缺少 groups")
         groups: list[dict[str, Any]] = []
@@ -1063,6 +1478,8 @@ def write_trajectories(samples: list[dict[str, Any]], output: Path) -> None:
     fields = [
         "time_s", "frame_index", "side", "valid_mask", "x", "y", "z",
         "world_x", "world_y", "world_z", "raw_speed", "smoothed_speed",
+        "motion_source", "motion_weight", "boundary_x", "boundary_y",
+        "interpolated_for_motion",
     ]
     with output.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=fields)
@@ -1073,12 +1490,17 @@ def write_trajectories(samples: list[dict[str, Any]], output: Path) -> None:
                 wrist = hand["landmarks_2d_relative"][0] if hand else {}
                 world = ((hand.get("landmarks_3d_relative") or [{}])[0] if hand else {})
                 motion = sample["hand_motion"][side]
+                track = sample["hand_tracks"][side]
+                boundary_center = track.get("boundary_palm_center") or {}
                 writer.writerow({
                     "time_s": sample["time_s"], "frame_index": sample["frame_index"],
                     "side": side, "valid_mask": bool(hand),
                     "x": wrist.get("x"), "y": wrist.get("y"), "z": wrist.get("z"),
                     "world_x": world.get("x"), "world_y": world.get("y"), "world_z": world.get("z"),
                     "raw_speed": motion["raw_speed"], "smoothed_speed": motion["smoothed_speed"],
+                    "motion_source": motion.get("source"), "motion_weight": motion.get("weight", 0.0),
+                    "boundary_x": boundary_center.get("x"), "boundary_y": boundary_center.get("y"),
+                    "interpolated_for_motion": track.get("interpolated_for_motion", False),
                 })
 
 
@@ -1155,8 +1577,14 @@ def run(args: argparse.Namespace) -> None:
 
     samples = sample_and_track(info, args.sample_fps, args.hand_confidence)
     annotate_hand_validity(samples, args.hand_gap_tolerance)
-    attach_hand_motion(samples, args.min_camera_motion_quality, args.velocity_smoothing_radius_s)
-    actual_sample_fps = 1.0 / float(np.median(np.diff([sample["time_s"] for sample in samples]))) if len(samples) > 1 else args.sample_fps
+    attach_hand_motion(
+        samples, args.min_camera_motion_quality, args.velocity_smoothing_radius_s,
+        args.motion_interpolation_gap_s, args.motion_interpolation_max_displacement,
+    )
+    actual_sample_fps = (
+        (len(samples) - 1) / max(samples[-1]["time_s"] - samples[0]["time_s"], 1e-6)
+        if len(samples) > 1 else args.sample_fps
+    )
 
     velocity_candidates = find_velocity_candidates(samples, args)
     technical_candidates = _long_no_hand_boundaries(
@@ -1170,25 +1598,26 @@ def run(args: argparse.Namespace) -> None:
     candidates = consolidate_boundaries(candidates, args.minimum_provisional_duration_s)
     boundary_by_index = {item["index"]: item for item in candidates}
     provisional_spans = spans_from_boundaries(candidates, len(samples))
-    provisional = [
+    initial_provisional = [
         segment_record(span, samples, index + 1, "candidate_fine", info.duration_s, args)
         for index, span in enumerate(provisional_spans)
     ]
-    print(f"[info] 腕速候选边界 {len(velocity_candidates)} 个；待描述候选细片段 {len(provisional)} 个…")
+    print(f"[info] 腕速候选边界 {len(velocity_candidates)} 个；待描述候选细片段 {len(initial_provisional)} 个…")
 
-    for segment in tqdm(provisional, desc="VLM细粒度标注", unit="clip"):
-        if segment["hand_coverage"] < args.min_hand_coverage:
-            annotation = fallback_annotation(segment, "手部长时间不可见，跳过 VLM 标注")
-            annotation["annotation_source"] = "skipped_no_hand"
-        else:
-            frames, frame_times = sample_segment_frames(info, segment, args.fine_frame_count)
-            annotation = (
-                vlm_annotation(
-                    frames, frame_times, segment, args.vlm_api_base, args.vlm_model, args.vlm_image_max_side,
-                ) if frames else fallback_annotation(segment, "无法读取候选片段帧")
-            )
-        segment["semantic_annotation"] = annotation
-        segment["caption_zh"] = annotation_caption(annotation)
+    for segment in tqdm(initial_provisional, desc="VLM细粒度标注", unit="clip"):
+        annotate_candidate_segment(segment, info, args)
+
+    provisional, refinement_boundaries, refined_parent_count = refine_multi_action_segments(
+        initial_provisional, samples, info, args,
+    )
+    if refinement_boundaries:
+        for boundary in refinement_boundaries:
+            boundary_by_index[boundary["index"]] = boundary
+        candidates = sorted(boundary_by_index.values(), key=lambda item: item["time_s"])
+        print(
+            f"[info] VLM 多动作补切 {refined_parent_count} 个父片段，"
+            f"新增 {len(refinement_boundaries)} 个候选边界；重新描述后共 {len(provisional)} 个候选细片段。"
+        )
 
     fine, removed_boundaries = merge_fine_segments(
         provisional, boundary_by_index, samples, info, args,
@@ -1212,6 +1641,8 @@ def run(args: argparse.Namespace) -> None:
             })
     for segment in coarse:
         annotation = segment["coarse_annotation"]
+        if annotation.get("annotation_source") == "technical_no_hand_gap":
+            continue
         if annotation.get("confidence", 0.0) < args.review_confidence:
             review_queue.append({
                 "level": "coarse", "segment_id": segment["id"],
@@ -1220,21 +1651,32 @@ def run(args: argparse.Namespace) -> None:
             })
 
     valid_ids = [segment["id"] for segment in fine if segment["valid_operation"]]
-    vlm_segments = [segment for segment in provisional if segment["semantic_annotation"]["annotation_source"] == "vlm"]
+    refinement_children = [segment for segment in provisional if "refined_from" in segment]
+    annotation_attempts = initial_provisional + refinement_children
+    vlm_eligible = [segment for segment in annotation_attempts if segment["hand_coverage"] >= args.min_hand_coverage]
+    vlm_segments = [
+        segment for segment in annotation_attempts
+        if segment["semantic_annotation"]["annotation_source"] == "vlm"
+    ]
     payload = {
-        "schema_version": "0.3",
+        "schema_version": "0.4",
         "video": asdict(info),
         "parameters": vars(args),
         "segmentation": {
             "order": "fine_first_then_coarse_summary",
-            "fine_method": "camera_compensated_per_hand_speed_minima_then_vlm_semantic_merge",
+            "fine_method": "weighted_interpolated_per_hand_and_global_speed_minima_then_vlm_refine_and_merge",
             "coarse_method": coarse_method,
             "actual_sample_fps": round(actual_sample_fps, 4),
             "velocity_candidate_count": len(velocity_candidates),
+            "initial_provisional_fine_count": len(initial_provisional),
             "provisional_fine_count": len(provisional),
+            "vlm_multi_action_refined_parent_count": refined_parent_count,
+            "vlm_refinement_boundary_count": len(refinement_boundaries),
             "final_fine_count": len(fine),
             "removed_semantic_boundary_count": len(removed_boundaries),
-            "vlm_fine_response_success_ratio": round(len(vlm_segments) / max(1, len(provisional)), 3),
+            "vlm_eligible_segment_count": len(vlm_eligible),
+            "vlm_successful_segment_count": len(vlm_segments),
+            "vlm_fine_response_success_ratio": round(len(vlm_segments) / max(1, len(vlm_eligible)), 3),
             "boundary_candidates": candidates,
             "removed_boundaries": removed_boundaries,
         },
@@ -1267,15 +1709,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hand-confidence", type=float, default=0.55, help="MediaPipe 手部检测/跟踪阈值")
     parser.add_argument("--hand-gap-tolerance", type=float, default=0.5, help="仅桥接手部存在状态的短缺失时长，默认 0.5 秒")
     parser.add_argument("--min-camera-motion-quality", type=float, default=0.15, help="背景相机运动补偿最低质量")
+    parser.add_argument("--motion-interpolation-gap-s", type=float, default=0.5, help="仅供边界计算的掌心短缺失补全上限，默认 0.5 秒")
+    parser.add_argument("--motion-interpolation-max-displacement", type=float, default=0.25, help="允许补全的最大相机补偿位移，按画面对角线归一化")
     parser.add_argument("--velocity-smoothing-radius-s", type=float, default=0.25, help="速度高斯平滑半径，默认 0.25 秒")
     parser.add_argument("--velocity-context-s", type=float, default=0.75, help="速度谷前后参考窗口，默认 0.75 秒")
     parser.add_argument("--velocity-center-s", type=float, default=0.20, help="速度谷中心排除半径，默认 0.20 秒")
-    parser.add_argument("--velocity-drop-ratio", type=float, default=0.40, help="速度谷相对下降阈值，默认 0.40")
-    parser.add_argument("--velocity-prominence", type=float, default=0.20, help="速度谷归一化显著性阈值，默认 0.20")
-    parser.add_argument("--velocity-min-gap-s", type=float, default=0.80, help="同手腕速候选最短间隔，默认 0.8 秒")
+    parser.add_argument("--velocity-drop-ratio", type=float, default=0.25, help="速度谷相对下降阈值，默认 0.25")
+    parser.add_argument("--velocity-prominence", type=float, default=0.10, help="速度谷归一化显著性阈值，默认 0.10")
+    parser.add_argument("--velocity-min-gap-s", type=float, default=0.60, help="同一速度序列候选最短间隔，默认 0.6 秒")
+    parser.add_argument("--velocity-min-window-weight", type=float, default=0.60, help="速度谷前后窗口最低加权覆盖率，默认 0.60")
     parser.add_argument("--hand-boundary-fusion-s", type=float, default=0.40, help="左右手候选融合容差，默认 0.4 秒")
     parser.add_argument("--minimum-provisional-duration-s", type=float, default=0.60, help="候选片段最短时长，默认 0.6 秒")
-    parser.add_argument("--max-provisional-segment-s", type=float, default=12.0, help="仅为VLM分析插入的最长候选窗口，默认 12 秒")
+    parser.add_argument("--max-provisional-segment-s", type=float, default=8.0, help="仅为VLM分析插入的最长候选窗口，默认 8 秒")
+    parser.add_argument("--max-vlm-refinement-splits", type=int, default=2, help="每个多动作候选最多自动补切边界数，默认 2")
+    parser.add_argument("--vlm-refinement-search-s", type=float, default=1.0, help="VLM建议时间附近搜索弱腕速谷的半径，默认 1 秒")
     parser.add_argument("--min-hand-coverage", type=float, default=0.30, help="有效片段最低平滑手部覆盖率，默认 0.30")
     parser.add_argument("--max-no-hand-gap-s", type=float, default=1.0, help="有效视频允许的最长双手不可见间隔，默认 1 秒")
     parser.add_argument("--min-export-duration-s", type=float, default=0.5, help="导出有效视频的最短时长，默认 0.5 秒")

@@ -3,9 +3,11 @@
 /data/
 
 /ego_video_annotation/outputs/
+annotations.json
+hand_landmarks.json
+hand_overlay.mp4
 __pycache__/
 *.py[cod]
 .venv/
 env/
 .env
-
