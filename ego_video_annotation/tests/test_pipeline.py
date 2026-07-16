@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import sys
 import unittest
+import os
 from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -20,8 +22,11 @@ from egoanno.pipeline import (  # noqa: E402
     consolidate_boundaries,
     find_velocity_candidates,
     _refinement_indices,
+    normalize_annotation,
     segment_record,
     spans_from_boundaries,
+    recaption_merged_fine_segments,
+    VideoInfo,
 )
 
 
@@ -194,6 +199,43 @@ class SemanticMergeTests(unittest.TestCase):
         left = self.annotation("右手|拿起|杯子", "拿起", "杯子")
         right = self.annotation("右手|放下|杯子", "放下", "杯子")
         self.assertFalse(compatible_fine_annotations(left, right))
+
+
+class FineAnnotationSchemaTests(unittest.TestCase):
+    def test_coarse_stage_from_vlm_is_not_emitted(self) -> None:
+        annotation = normalize_annotation(
+            {"coarse_stage": "切配", "subtask": "切蒜", "confidence": 0.9},
+            {"hand_coverage": 1.0},
+        )
+        self.assertNotIn("coarse_stage", annotation)
+
+
+class MergedRecaptionTests(unittest.TestCase):
+    def test_successful_full_clip_recaption_replaces_old_annotation(self) -> None:
+        old = SemanticMergeTests.annotation("右手|切割|蒜", "切割", "蒜")
+        old.update({
+            "scene": "厨房", "left_hand": {}, "right_hand": {},
+            "temporal_evidence": "局部", "contains_multiple_actions": False, "confidence": 0.9,
+        })
+        segment = {
+            "id": "fine_001", "valid_operation": True, "merged_from": ["a", "b"],
+            "duration_s": 12.0, "start_s": 0.0, "end_s": 12.0, "hand_coverage": 1.0,
+            "semantic_annotation": old, "caption_zh": "旧描述",
+        }
+        new = {**old, "subtask": "连续切蒜", "action": {"verb": "切割", "description": "完整切蒜过程"}}
+        info = VideoInfo("dummy.mp4", 30.0, 360, 640, 480, 12.0)
+        config = Namespace(
+            merged_recaption_min_duration_s=8.0, fine_frame_count=16,
+            vlm_api_base="http://example", vlm_model="model", vlm_image_max_side=768,
+        )
+        with patch.dict(os.environ, {"VLM_API_KEY": "test-key"}), patch(
+            "egoanno.pipeline.sample_segment_frames",
+            return_value=([np.zeros((2, 2, 3), np.uint8)], [6.0]),
+        ), patch("egoanno.pipeline.vlm_annotation", return_value=new):
+            attempted, succeeded = recaption_merged_fine_segments([segment], info, config)
+        self.assertEqual((attempted, succeeded), (1, 1))
+        self.assertEqual(segment["semantic_annotation"]["subtask"], "连续切蒜")
+        self.assertEqual(segment["pre_recaption_annotation"]["subtask"], old["subtask"])
 
 
 if __name__ == "__main__":

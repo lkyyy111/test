@@ -1,9 +1,8 @@
-"""Fine-first egocentric video annotation pipeline.
+"""Fine-grained egocentric video annotation pipeline.
 
 The pipeline deliberately treats kinematic boundaries as high-recall candidates:
 camera-compensated hand-speed valleys propose atomic clips, a VLM captions those
-clips, and adjacent clips with the same semantics are merged.  Coarse tasks are
-then summarized from the final fine-grained sequence.
+clips, and adjacent clips with the same semantics are merged.
 """
 from __future__ import annotations
 
@@ -32,7 +31,6 @@ HAND_CONNECTIONS = (
 )
 HAND_SIDES = ("left", "right")
 PALM_LANDMARKS = (0, 5, 9, 13, 17)
-COARSE_STAGES = {"准备", "取放", "清洗", "切配", "烹饪", "整理", "移动", "等待", "其他"}
 CAMERA_MOTION_SIZE = (320, 180)
 
 
@@ -866,7 +864,6 @@ def fallback_annotation(segment: dict[str, Any], reason: str = "未配置或未�
     )
     return {
         "scene": "未知",
-        "coarse_stage": "其他",
         "subtask": "未知",
         "semantic_key": "未知",
         "left_hand": {"visible": False, "action": "未知", "object": "未知物体", "description": "未知"},
@@ -904,9 +901,6 @@ def normalize_annotation(raw: Any, segment: dict[str, Any]) -> dict[str, Any]:
         objects = [objects]
     if not isinstance(objects, list):
         objects = ["未知物体"]
-    stage = str(raw.get("coarse_stage") or "其他").strip()
-    if stage not in COARSE_STAGES:
-        stage = "其他"
     try:
         confidence = float(raw.get("confidence", 0.0))
     except (TypeError, ValueError):
@@ -946,7 +940,6 @@ def normalize_annotation(raw: Any, segment: dict[str, Any]) -> dict[str, Any]:
             normalized_boundaries.append(frame_number)
     return {
         "scene": str(raw.get("scene") or "未知").strip(),
-        "coarse_stage": stage,
         "subtask": str(raw.get("subtask") or "未知").strip(),
         "semantic_key": semantic_key,
         "left_hand": left,
@@ -970,7 +963,7 @@ def annotation_caption(annotation: dict[str, Any]) -> str:
     return f"{annotation['subtask']}：{annotation['action']['description']}"
 
 
-def parse_json_response(content: Any) -> dict[str, Any] | None:
+def parse_json_response(content: Any) -> Any:
     if isinstance(content, list):
         content = " ".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
     if not isinstance(content, str):
@@ -979,13 +972,15 @@ def parse_json_response(content: Any) -> dict[str, Any] | None:
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-        if not match:
-            return None
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return None
+        for pattern in (r"\{.*\}", r"\[.*\]"):
+            match = re.search(pattern, cleaned, flags=re.DOTALL)
+            if not match:
+                continue
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                continue
+        return None
 
 
 def _resize_for_vlm(frame: np.ndarray, max_side: int) -> np.ndarray:
@@ -1003,14 +998,20 @@ def vlm_annotation(
     key = os.getenv("VLM_API_KEY")
     if not key or not api_base or not model:
         return fallback_annotation(segment)
+    caption_context = (
+        "这是多个相邻同语义候选合并后的完整细粒度片段。请基于全部时间范围重新生成整体描述，"
+        "描述必须覆盖整段，而不是只描述某个局部窗口；若合并后实际包含不同语义动作，"
+        "仍应如实设置 contains_multiple_actions=true。"
+        if segment.get("merged_recaption_request") else ""
+    )
     content: list[dict[str, Any]] = [{"type": "text", "text": (
         f"以下 {len(frames)} 帧按时间顺序来自同一第一视角候选细粒度片段，时间 "
         f"{segment['start_s']:.2f}s–{segment['end_s']:.2f}s，手部覆盖率 {segment['hand_coverage']:.0%}。\n"
+        f"{caption_context}"
         "连续切割、连续清洗、连续擦拭、连续搅拌等周期运动应视为一个语义动作，不要按每次往返拆开。"
         "只输出合法 JSON，不要 Markdown、解释或额外字段：\n"
         "{\n"
         '  "scene":"场景",\n'
-        '  "coarse_stage":"准备|取放|清洗|切配|烹饪|整理|移动|等待|其他",\n'
         '  "subtask":"简短且稳定的子任务名称",\n'
         '  "semantic_key":"规范化语义键，例如 右手|切割|蒜；相同连续动作必须用相同键",\n'
         '  "left_hand":{"visible":true,"action":"动作或无","object":"物体或未知物体","description":"简述"},\n'
@@ -1339,126 +1340,50 @@ def merge_fine_segments(
     return final, removed
 
 
-def _fallback_coarse_groups(fine: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    groups: list[dict[str, Any]] = []
-    for segment in fine:
-        annotation = segment["semantic_annotation"]
-        if not segment["valid_operation"]:
-            if groups and groups[-1]["annotation_source"] == "technical_no_hand_gap":
-                groups[-1]["fine_ids"].append(segment["id"])
-            else:
-                groups.append({
-                    "fine_ids": [segment["id"]],
-                    "coarse_stage": "其他",
-                    "task": "无有效手部操作",
-                    "description": "技术性无手区间，不作为粗粒度操作任务。",
-                    "confidence": 1.0,
-                    "annotation_source": "technical_no_hand_gap",
-                })
+def recaption_merged_fine_segments(
+    fine: list[dict[str, Any]], info: VideoInfo, args: argparse.Namespace,
+) -> tuple[int, int]:
+    """Re-caption long merged clips over their full duration; keep old labels on failure."""
+    targets = [
+        segment for segment in fine
+        if segment["valid_operation"]
+        and len(segment.get("merged_from", [])) > 1
+        and segment["duration_s"] >= args.merged_recaption_min_duration_s
+    ]
+    if not targets or not os.getenv("VLM_API_KEY") or not args.vlm_api_base or not args.vlm_model:
+        return 0, 0
+    print(f"[info] 对 {len(targets)} 个合并后长片段重新进行整体 VLM 描述…")
+    success = 0
+    for segment in tqdm(targets, desc="合并长片段重描述", unit="clip"):
+        previous = segment["semantic_annotation"]
+        frames, frame_times = sample_segment_frames(info, segment, args.fine_frame_count)
+        if not frames:
+            segment["merged_recaption"] = {
+                "status": "failed", "reason": "无法读取合并后片段帧", "frame_times_s": [],
+            }
             continue
-        stage = annotation["coarse_stage"]
-        if (
-            groups and groups[-1]["annotation_source"] == "fine_label_fallback"
-            and groups[-1]["coarse_stage"] == stage and stage != "其他"
-        ):
-            groups[-1]["fine_ids"].append(segment["id"])
-        else:
-            groups.append({
-                "fine_ids": [segment["id"]],
-                "coarse_stage": stage,
-                "task": annotation["subtask"],
-                "description": annotation["action"]["description"],
-                "confidence": annotation.get("confidence", 0.0),
-                "annotation_source": "fine_label_fallback",
-            })
-    return groups
-
-
-def summarize_coarse_from_fine(
-    fine: list[dict[str, Any]], api_base: str | None, model: str | None,
-) -> tuple[list[dict[str, Any]], str]:
-    """Ask the VLM to group the ordered final fine labels into contiguous tasks."""
-    key = os.getenv("VLM_API_KEY")
-    if not key or not api_base or not model:
-        return _fallback_coarse_groups(fine), "fine_label_fallback"
-    compact = [{
-        "id": item["id"], "start_s": item["start_s"], "end_s": item["end_s"],
-        "subtask": item["semantic_annotation"]["subtask"],
-        "semantic_key": item["semantic_annotation"]["semantic_key"],
-        "description": item["semantic_annotation"]["action"]["description"],
-        "objects": item["semantic_annotation"]["objects"],
-        "valid_operation": item["valid_operation"],
-    } for item in fine]
-    prompt = (
-        "下面是一个第一视角视频按时间排序的最终细粒度动作 JSON。请把相邻动作归纳成粗粒度任务。"
-        "只能组合连续 fine id；必须按顺序覆盖每个 fine id 恰好一次；不能修改时间或编造 id。"
-        "valid_operation=false 的片段必须单独作为无有效手部操作的技术间隔，不能与前后任务合并。"
-        "只输出合法 JSON："
-        '{"groups":[{"fine_ids":["fine_001"],"coarse_stage":"准备|取放|清洗|切配|烹饪|整理|移动|等待|其他",'
-        '"task":"粗任务名","description":"由这些细动作归纳的任务描述","confidence":0.0}]}\n'
-        + json.dumps(compact, ensure_ascii=False)
-    )
-    body = {"model": model, "temperature": 0.0, "max_tokens": 2048, "messages": [
-        {"role": "system", "content": "你是严格的视频层级标注员，只能输出指定 JSON。"},
-        {"role": "user", "content": prompt},
-    ]}
-    try:
-        response = requests.post(
-            api_base.rstrip("/") + "/chat/completions",
-            headers={"Authorization": f"Bearer {key}"}, json=body, timeout=120,
+        request_segment = {**segment, "merged_recaption_request": True}
+        annotation = vlm_annotation(
+            frames, frame_times, request_segment, args.vlm_api_base, args.vlm_model,
+            args.vlm_image_max_side,
         )
-        response.raise_for_status()
-        raw = parse_json_response(response.json()["choices"][0]["message"]["content"])
-        raw_groups = raw if isinstance(raw, list) else None
-        if isinstance(raw, dict):
-            for key_name in ("groups", "coarse_groups", "task_groups", "segments"):
-                if isinstance(raw.get(key_name), list):
-                    raw_groups = raw[key_name]
-                    break
-        if not isinstance(raw_groups, list):
-            raise ValueError("粗粒度响应缺少 groups")
-        groups: list[dict[str, Any]] = []
-        for group in raw_groups:
-            if not isinstance(group, dict) or not isinstance(group.get("fine_ids"), list):
-                raise ValueError("粗粒度 group 格式错误")
-            stage = str(group.get("coarse_stage") or "其他")
-            if stage not in COARSE_STAGES:
-                stage = "其他"
-            groups.append({
-                "fine_ids": [str(item) for item in group["fine_ids"]],
-                "coarse_stage": stage,
-                "task": str(group.get("task") or "未知任务"),
-                "description": str(group.get("description") or "未提供"),
-                "confidence": round(float(np.clip(float(group.get("confidence", 0.0)), 0.0, 1.0)), 3),
-                "annotation_source": "vlm_fine_sequence_summary",
-            })
-        expected = [item["id"] for item in fine]
-        flattened = [fine_id for group in groups for fine_id in group["fine_ids"]]
-        if flattened != expected:
-            raise ValueError("粗粒度分组未按顺序完整覆盖 fine ids")
-        return groups, "vlm_fine_sequence_summary"
-    except (requests.RequestException, KeyError, IndexError, TypeError, ValueError) as error:
-        print(f"[warning] 粗粒度归纳失败，使用细标签规则分组：{error}")
-        return _fallback_coarse_groups(fine), "fine_label_fallback"
-
-
-def build_coarse_records(
-    groups: list[dict[str, Any]], fine: list[dict[str, Any]], samples: list[dict[str, Any]],
-    info: VideoInfo, args: argparse.Namespace,
-) -> list[dict[str, Any]]:
-    by_id = {item["id"]: item for item in fine}
-    coarse: list[dict[str, Any]] = []
-    for index, group in enumerate(groups, 1):
-        members = [by_id[fine_id] for fine_id in group["fine_ids"]]
-        span = (members[0]["sample_start"], members[-1]["sample_end"] + 1)
-        record = segment_record(span, samples, index, "coarse", info.duration_s, args)
-        record["fine_ids"] = group["fine_ids"]
-        record["coarse_annotation"] = {key: value for key, value in group.items() if key != "fine_ids"}
-        record["caption_zh"] = f"{group['task']}：{group['description']}"
-        coarse.append(record)
-        for member in members:
-            member["parent_coarse_id"] = record["id"]
-    return coarse
+        if annotation.get("annotation_source") != "vlm":
+            segment["merged_recaption"] = {
+                "status": "failed",
+                "reason": annotation.get("failure_reason", "VLM 重描述失败"),
+                "frame_times_s": [round(time_s, 3) for time_s in frame_times],
+            }
+            continue
+        annotation["annotation_stage"] = "merged_full_clip_recaption"
+        segment["pre_recaption_annotation"] = previous
+        segment["semantic_annotation"] = annotation
+        segment["caption_zh"] = annotation_caption(annotation)
+        segment["merged_recaption"] = {
+            "status": "success",
+            "frame_times_s": [round(time_s, 3) for time_s in frame_times],
+        }
+        success += 1
+    return len(targets), success
 
 
 def review_reasons(annotation: dict[str, Any], threshold: float) -> list[str]:
@@ -1622,9 +1547,9 @@ def run(args: argparse.Namespace) -> None:
     fine, removed_boundaries = merge_fine_segments(
         provisional, boundary_by_index, samples, info, args,
     )
-    groups, coarse_method = summarize_coarse_from_fine(fine, args.vlm_api_base, args.vlm_model)
-    coarse = build_coarse_records(groups, fine, samples, info, args)
-
+    merged_recaption_count, merged_recaption_success_count = recaption_merged_fine_segments(
+        fine, info, args,
+    )
     review_queue: list[dict[str, Any]] = []
     for segment in fine:
         if not segment["valid_operation"]:
@@ -1639,17 +1564,6 @@ def run(args: argparse.Namespace) -> None:
                 "level": "fine", "segment_id": segment["id"],
                 "start_s": segment["start_s"], "end_s": segment["end_s"], "reasons": reasons,
             })
-    for segment in coarse:
-        annotation = segment["coarse_annotation"]
-        if annotation.get("annotation_source") == "technical_no_hand_gap":
-            continue
-        if annotation.get("confidence", 0.0) < args.review_confidence:
-            review_queue.append({
-                "level": "coarse", "segment_id": segment["id"],
-                "start_s": segment["start_s"], "end_s": segment["end_s"],
-                "reasons": [f"粗粒度归纳置信度 {annotation.get('confidence', 0.0):.2f} 低于阈值 {args.review_confidence:.2f}"],
-            })
-
     valid_ids = [segment["id"] for segment in fine if segment["valid_operation"]]
     refinement_children = [segment for segment in provisional if "refined_from" in segment]
     annotation_attempts = initial_provisional + refinement_children
@@ -1659,13 +1573,12 @@ def run(args: argparse.Namespace) -> None:
         if segment["semantic_annotation"]["annotation_source"] == "vlm"
     ]
     payload = {
-        "schema_version": "0.4",
+        "schema_version": "0.6",
         "video": asdict(info),
         "parameters": vars(args),
         "segmentation": {
-            "order": "fine_first_then_coarse_summary",
+            "order": "fine_only",
             "fine_method": "weighted_interpolated_per_hand_and_global_speed_minima_then_vlm_refine_and_merge",
-            "coarse_method": coarse_method,
             "actual_sample_fps": round(actual_sample_fps, 4),
             "velocity_candidate_count": len(velocity_candidates),
             "initial_provisional_fine_count": len(initial_provisional),
@@ -1677,6 +1590,8 @@ def run(args: argparse.Namespace) -> None:
             "vlm_eligible_segment_count": len(vlm_eligible),
             "vlm_successful_segment_count": len(vlm_segments),
             "vlm_fine_response_success_ratio": round(len(vlm_segments) / max(1, len(vlm_eligible)), 3),
+            "merged_recaption_segment_count": merged_recaption_count,
+            "merged_recaption_success_count": merged_recaption_success_count,
             "boundary_candidates": candidates,
             "removed_boundaries": removed_boundaries,
         },
@@ -1685,7 +1600,6 @@ def run(args: argparse.Namespace) -> None:
             "motion": "2D palm speed after background affine camera-motion compensation, normalized by analysis-frame diagonal per second",
             "world": "MediaPipe relative hand coordinates; not calibrated metric world space",
         },
-        "coarse_segments": coarse,
         "fine_segments": fine,
         "valid_segments": valid_ids,
         "review_queue": review_queue,
@@ -1702,7 +1616,7 @@ def run(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="第一视角视频：细到粗切分、语言标注、21点手姿态和轨迹")
+    parser = argparse.ArgumentParser(description="第一视角视频：细粒度切分、语言标注、21点手姿态和轨迹")
     parser.add_argument("--video", required=True, help="输入视频路径")
     parser.add_argument("--output", required=True, help="输出目录")
     parser.add_argument("--sample-fps", type=float, default=8.0, help="手部与运动分析采样帧率，默认 8")
@@ -1727,6 +1641,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-no-hand-gap-s", type=float, default=1.0, help="有效视频允许的最长双手不可见间隔，默认 1 秒")
     parser.add_argument("--min-export-duration-s", type=float, default=0.5, help="导出有效视频的最短时长，默认 0.5 秒")
     parser.add_argument("--fine-frame-count", type=int, default=16, help="每个候选细片段最多发送给VLM的均匀帧数，默认 16")
+    parser.add_argument("--merged-recaption-min-duration-s", type=float, default=8.0, help="合并后触发整体重描述的最短片段时长，默认 8 秒")
     parser.add_argument("--vlm-image-max-side", type=int, default=768, help="发送给VLM前的图像最长边，默认 768")
     parser.add_argument("--vlm-api-base", default=None, help="兼容 Chat Completions 的 API 基地址")
     parser.add_argument("--vlm-model", default=None, help="视觉语言模型名称；密钥从 VLM_API_KEY 读取")
