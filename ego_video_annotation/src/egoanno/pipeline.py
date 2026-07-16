@@ -34,6 +34,16 @@ PALM_LANDMARKS = (0, 5, 9, 13, 17)
 CAMERA_MOTION_SIZE = (320, 180)
 
 
+def correct_mediapipe_handedness(label: str) -> str:
+    """Map MediaPipe's mirrored-input handedness to a non-mirrored egocentric view."""
+    normalized = str(label).lower()
+    if normalized == "left":
+        return "right"
+    if normalized == "right":
+        return "left"
+    return "unknown"
+
+
 @dataclass
 class VideoInfo:
     path: str
@@ -90,17 +100,20 @@ class HandTracker:
             points_3d = self._points(world_landmarks) if world_landmarks else None
             if points_3d is not None and not self._valid_points(points_3d):
                 points_3d = None
-            label, score = "unknown", 0.0
+            mediapipe_side, score = "unknown", 0.0
             if label_data and label_data.classification:
-                label = label_data.classification[0].label.lower()
+                mediapipe_side = label_data.classification[0].label.lower()
                 score = float(label_data.classification[0].score)
-            if label not in HAND_SIDES:
-                label = "unknown"
+            if mediapipe_side not in HAND_SIDES:
+                mediapipe_side = "unknown"
+            detector_side = correct_mediapipe_handedness(mediapipe_side)
             if not math.isfinite(score):
                 score = 0.0
             detected.append({
-                "raw_side": label,
-                "side": label,
+                "mediapipe_side": mediapipe_side,
+                "detector_side": detector_side,
+                "raw_side": mediapipe_side,
+                "side": detector_side,
                 "score": round(score, 4),
                 "landmarks_2d_relative": points_2d,
                 "landmarks_3d_relative": points_3d,
@@ -145,7 +158,7 @@ class HandIdentityTracker:
         for slots in assignments:
             cost = 0.0
             for hand, center, slot in zip(hands, centers, slots):
-                raw_side = hand.get("raw_side", "unknown")
+                raw_side = hand.get("detector_side", hand.get("raw_side", "unknown"))
                 raw_score = float(hand.get("score", 0.0))
                 if not math.isfinite(raw_score):
                     raw_score = 0.0
@@ -164,7 +177,7 @@ class HandIdentityTracker:
             available = list(HAND_SIDES)
             fallback: list[str] = []
             for hand in hands:
-                raw_side = hand.get("raw_side")
+                raw_side = hand.get("detector_side", hand.get("raw_side"))
                 slot = raw_side if raw_side in available else available[0]
                 fallback.append(slot)
                 available.remove(slot)

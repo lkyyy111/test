@@ -21,6 +21,7 @@ from egoanno.pipeline import (  # noqa: E402
     build_clean_annotations,
     compatible_fine_annotations,
     consolidate_boundaries,
+    correct_mediapipe_handedness,
     find_velocity_candidates,
     _refinement_indices,
     normalize_annotation,
@@ -42,6 +43,19 @@ def detected_hand(side: str, x: float, score: float = 0.9) -> dict:
 
 
 class HandIdentityTests(unittest.TestCase):
+    def test_non_mirrored_egocentric_handedness_is_swapped(self) -> None:
+        self.assertEqual(correct_mediapipe_handedness("Left"), "right")
+        self.assertEqual(correct_mediapipe_handedness("Right"), "left")
+        self.assertEqual(correct_mediapipe_handedness("unknown"), "unknown")
+
+    def test_identity_tracker_prefers_corrected_detector_side(self) -> None:
+        tracker = HandIdentityTracker()
+        hand = detected_hand("left", 0.7)
+        hand["mediapipe_side"] = "left"
+        hand["detector_side"] = "right"
+        assigned = tracker.assign([hand], 0.0)
+        self.assertEqual(assigned[0]["side"], "right")
+
     def test_non_finite_detection_is_dropped_instead_of_crashing(self) -> None:
         tracker = HandIdentityTracker()
         assigned = tracker.assign([detected_hand("left", float("nan"))], 1.0)
