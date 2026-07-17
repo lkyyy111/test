@@ -1419,7 +1419,7 @@ def clip_filename(segment: dict[str, Any]) -> str:
 def build_clean_annotations(
     info: VideoInfo, fine: list[dict[str, Any]], clips_exported: bool,
 ) -> dict[str, Any]:
-    """Build the compact, training-facing annotation file from reviewed fine clips."""
+    """Build compact annotations while retaining usable clips marked for review."""
     clips: list[dict[str, Any]] = []
     for segment in fine:
         annotation = segment["semantic_annotation"]
@@ -1427,9 +1427,9 @@ def build_clean_annotations(
             segment["valid_operation"]
             and annotation.get("annotation_source") == "vlm"
             and annotation.get("meaningful_action", False)
-            and not segment.get("needs_review", False)
         ):
             continue
+        needs_review = bool(segment.get("needs_review", False))
         hands = {
             output_side: {
                 "visible": bool(annotation[annotation_side].get("visible", False)),
@@ -1460,9 +1460,11 @@ def build_clean_annotations(
                 "hand_coverage": segment["hand_coverage"],
                 "vlm_confidence": annotation["confidence"],
             },
+            "quality_status": "review" if needs_review else "accepted",
+            "review_reasons": list(segment.get("review_reasons", [])),
         })
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "video": {
             "id": Path(info.path).stem,
             "file": Path(info.path).name,
@@ -1694,7 +1696,7 @@ def run(args: argparse.Namespace) -> None:
         print("[info] 按最终细粒度边界导出有效操作片段…")
         write_valid_clips(info, fine, output / "valid_segments")
     print(
-        f"[done] 最终细片段：{len(fine)}；干净标注：{len(clean_annotations['clips'])}；"
+        f"[done] 最终细片段：{len(fine)}；标注输出：{len(clean_annotations['clips'])}；"
         f"有效视频：{len(valid_ids)}；待复核：{len(review_queue)}；结果目录：{output}"
     )
 

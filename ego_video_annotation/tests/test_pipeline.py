@@ -251,9 +251,12 @@ class FineAnnotationSchemaTests(unittest.TestCase):
         result.update(overrides)
         return result
 
-    def test_clean_annotations_keep_only_reviewed_vlm_actions(self) -> None:
+    def test_clean_annotations_retain_reviewable_vlm_actions_with_status(self) -> None:
         accepted = self.segment("fine_001")
-        rejected_review = self.segment("fine_002", needs_review=True)
+        reviewable = self.segment(
+            "fine_002", needs_review=True,
+            review_reasons=["VLM 判断候选片段可能包含多个动作，可能漏切"],
+        )
         rejected_invalid = self.segment("fine_003", valid_operation=False)
         fallback = self.segment("fine_004")
         fallback["semantic_annotation"] = {
@@ -262,19 +265,25 @@ class FineAnnotationSchemaTests(unittest.TestCase):
         info = VideoInfo("/dataset/long1.mp4", 50.0, 15000, 1920, 1080, 300.0)
 
         payload = build_clean_annotations(
-            info, [accepted, rejected_review, rejected_invalid, fallback], clips_exported=True,
+            info, [accepted, reviewable, rejected_invalid, fallback], clips_exported=True,
         )
 
-        self.assertEqual(payload["schema_version"], "1.0")
+        self.assertEqual(payload["schema_version"], "1.1")
         self.assertEqual(payload["video"]["file"], "long1.mp4")
         self.assertEqual(payload["hand_data_file"], "hand_landmarks.json")
-        self.assertEqual(len(payload["clips"]), 1)
+        self.assertEqual(len(payload["clips"]), 2)
         clip = payload["clips"][0]
         self.assertEqual(clip["id"], "fine_001")
         self.assertEqual(clip["clip_path"], "valid_segments/fine_001_1.2-3.8s.mp4")
         self.assertEqual(clip["sample_range"], {"start": 10, "end": 29})
         self.assertEqual(set(clip["hands"]), {"left", "right"})
+        self.assertEqual(clip["quality_status"], "accepted")
+        self.assertEqual(clip["review_reasons"], [])
         self.assertNotIn("semantic_key", clip)
+        review_clip = payload["clips"][1]
+        self.assertEqual(review_clip["id"], "fine_002")
+        self.assertEqual(review_clip["quality_status"], "review")
+        self.assertEqual(len(review_clip["review_reasons"]), 1)
 
     def test_smoke_output_uses_null_clip_path(self) -> None:
         info = VideoInfo("short1.mp4", 30.0, 300, 640, 480, 10.0)

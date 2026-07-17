@@ -93,7 +93,7 @@ python run_pipeline.py \
 
 ## 输出
 
-- `annotations.json`：面向训练/交付的干净细粒度标注。仅保留手部有效、VLM 成功、动作有意义且无需复核的片段，包含时间、视频路径、caption、动作、物体、左右手信息、质量分数及 `hand_landmarks.json` 采样范围。
+- `annotations.json`：面向训练/交付的紧凑细粒度标注。保留手部有效、VLM 成功且动作有意义的片段；`quality_status` 为 `accepted` 或 `review`，后者同时保留 `review_reasons`，不会再因需要复核而整段丢失。文件包含时间、视频路径、caption、动作、物体、左右手信息、质量分数及 `hand_landmarks.json` 采样范围。
 - `annotations_diagnostics.json`：完整运行诊断，包括参数、候选与删除边界、全部有效/无效细片段、合并与重描述历史以及复核队列。
 - `hand_landmarks.json`：每个采样时刻的左右手 21 点、有效性 mask、相机补偿质量和速度。
 - `wrist_trajectories.csv`：每个采样时刻固定输出左右手各一行；缺失手的真实坐标为空，并另外记录边界专用掌心、`motion_source`、权重和插值 mask。
