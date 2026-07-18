@@ -1,0 +1,7 @@
+# -*- coding: utf-8 -*-
+-r requirements.txt
+
+# Optional fourth-stage dependencies. The long-video annotation pipeline does
+# not import these packages unless --retarget-franka is enabled.
+mujoco>=3.2
+robot_descriptions>=1.12

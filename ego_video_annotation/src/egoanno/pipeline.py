@@ -1695,6 +1695,20 @@ def run(args: argparse.Namespace) -> None:
         write_overlay(info, samples, output / "hand_overlay.mp4")
         print("[info] 按最终细粒度边界导出有效操作片段…")
         write_valid_clips(info, fine, output / "valid_segments")
+    if getattr(args, "retarget_franka", False):
+        print(f"[info] 将整段 {args.retarget_hand} 手轨迹映射到 Franka…")
+        # Lazy import keeps MuJoCo and the Franka model optional. Long-video
+        # annotation runs are unchanged when --retarget-franka is absent.
+        from egoanno.retarget_franka import run_franka_retarget
+
+        retarget_metrics = run_franka_retarget(
+            info, samples, output / "franka_retarget", args,
+        )
+        print(
+            "[info] Franka retarget 完成："
+            f"IK RMSE={retarget_metrics['ik']['position_rmse_m']:.4f}m；"
+            f"仿真 RMSE={retarget_metrics['simulation']['position_rmse_m']:.4f}m"
+        )
     print(
         f"[done] 最终细片段：{len(fine)}；标注输出：{len(clean_annotations['clips'])}；"
         f"有效视频：{len(valid_ids)}；待复核：{len(review_queue)}；结果目录：{output}"
@@ -1733,6 +1747,42 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vlm-model", default=None, help="视觉语言模型名称；密钥从 VLM_API_KEY 读取")
     parser.add_argument("--review-confidence", type=float, default=0.65, help="低于该VLM置信度的有效片段进入复核队列")
     parser.add_argument("--skip-video-outputs", action="store_true", help="仅输出 JSON/CSV，不生成 MP4")
+    parser.add_argument(
+        "--retarget-franka", action="store_true",
+        help="可选：将整段单手轨迹映射到 MuJoCo Franka；默认关闭，不影响 long1",
+    )
+    parser.add_argument(
+        "--retarget-hand", choices=("left", "right"), default="right",
+        help="Franka 跟随的操作手，short1 使用 right",
+    )
+    parser.add_argument(
+        "--retarget-control-fps", type=float, default=50.0,
+        help="Franka 目标轨迹与控制频率，默认 50 Hz",
+    )
+    parser.add_argument(
+        "--retarget-gap-tolerance", type=float, default=0.5,
+        help="retarget 允许插值的短暂丢手上限；长缺失保持上一目标",
+    )
+    parser.add_argument(
+        "--retarget-robot-x", type=float, default=0.50,
+        help="short 单手竖直平面距 Franka 基座的前向位置（米）",
+    )
+    parser.add_argument(
+        "--retarget-y-range", type=float, default=0.10,
+        help="人体图像横向轨迹映射到 Franka 左右方向的半范围（米）",
+    )
+    parser.add_argument(
+        "--retarget-z-low", type=float, default=0.25,
+        help="short 抬放动作映射的最低末端高度（米）",
+    )
+    parser.add_argument(
+        "--retarget-z-high", type=float, default=0.50,
+        help="short 抬放动作映射的最高末端高度（米）",
+    )
+    parser.add_argument(
+        "--franka-model", default=None,
+        help="可选 Franka scene.xml/panda.xml；默认尝试 robot_descriptions 或 MUJOCO_MENAGERIE_PATH",
+    )
     return parser
 
 

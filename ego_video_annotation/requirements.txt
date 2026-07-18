@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 numpy>=1.24
 opencv-python>=4.8
 # 0.10.30+ removed the legacy mp.solutions API used by this baseline.

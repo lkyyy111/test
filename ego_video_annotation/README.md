@@ -106,3 +106,47 @@ python run_pipeline.py \
 ## 坐标局限
 
 MediaPipe 的 `x/y` 是图像归一化坐标，`z` 是相对深度；CSV 中 `world_x/y/z` 仍是 MediaPipe 的相对手部坐标，不是经过相机标定的米制世界坐标。当前速度使用背景仿射运动补偿后的二维掌心位移，适合本次轻量测试，但不等价于 VITRA 的完整世界坐标轨迹。
+
+## 可选 Franka retarget（short1）
+
+Franka retarget 是完全可选的第四阶段。默认不导入 MuJoCo，因此 long1 的安装方式、标注逻辑和输出保持不变。short1 使用整段右手腕轨迹，在固定前向距离的竖直平面中映射左右与抬放运动，再通过阻尼最小二乘 IK 和 Panda 位置执行器回放。
+
+安装可选依赖：
+
+```bash
+pip install -r requirements-retarget.txt
+```
+
+`robot_descriptions` 会提供 MuJoCo Menagerie 的 Panda MJCF。也可以自行克隆 Menagerie 并设置：
+
+```bash
+export MUJOCO_MENAGERIE_PATH="$HOME/mujoco_menagerie"
+```
+
+无显示器的 Linux 服务器建议在启动 Python 前启用 EGL：
+
+```bash
+export MUJOCO_GL=egl
+```
+
+short1 完整运行：
+
+```bash
+python run_pipeline.py \
+  --video ../data/short1.mp4 \
+  --output outputs/short1_franka \
+  --vlm-api-base "$VLM_API_BASE" \
+  --vlm-model "$VLM_MODEL" \
+  --retarget-franka \
+  --retarget-hand right
+```
+
+如果只想验证 IK 和 CSV，不生成任何 MP4，可额外添加 `--skip-video-outputs`。retarget 结果写入 `franka_retarget/`：
+
+- `target_trajectory.csv`：由右手腕图像轨迹映射得到的末端目标。
+- `joint_trajectory.csv`：仿真后的 Franka 七关节轨迹。
+- `achieved_trajectory.csv`：实际末端轨迹和逐时刻误差。
+- `retarget_metrics.json`：轨迹覆盖率、IK 与动力学跟踪误差。
+- `retarget.mp4`：Franka 回放；蓝色小球是当前目标点。
+
+long1 继续使用原命令，不添加 `--retarget-franka`。也不要根据文件名或时长自动启用 retarget；该开关由调用者显式控制。
