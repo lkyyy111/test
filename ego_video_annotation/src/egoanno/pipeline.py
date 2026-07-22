@@ -1020,6 +1020,10 @@ def vlm_annotation(
     content: list[dict[str, Any]] = [{"type": "text", "text": (
         f"以下 {len(frames)} 帧按时间顺序来自同一第一视角候选细粒度片段，时间 "
         f"{segment['start_s']:.2f}s–{segment['end_s']:.2f}s，手部覆盖率 {segment['hand_coverage']:.0%}。\n"
+        "每帧带有时间角色：[CLIP_FRAME]属于当前待标注片段；[CONTEXT_BEFORE]和"
+        "[CONTEXT_AFTER]位于片段边界外，只用于判断物体和手在动作前后的状态及动作方向。"
+        "动作、subtask和meaningful_action必须描述CLIP_FRAME中的内容，不得把上下文中的相邻动作"
+        "算入当前片段。action_sequence和suggested_boundary_frames只能引用CLIP_FRAME的帧号。\n"
         f"{caption_context}"
         "连续切割、连续清洗、连续擦拭、连续搅拌等周期运动应视为一个语义动作，不要按每次往返拆开。"
         "只输出合法 JSON，不要 Markdown、解释或额外字段：\n"
@@ -1040,16 +1044,22 @@ def vlm_annotation(
         "}\n"
         "若整段只有一个连续语义动作，contains_multiple_actions=false 且 suggested_boundary_frames=[]。"
         "若包含多个依次发生的动作，contains_multiple_actions=true，并用 action_sequence 描述各动作覆盖的帧号；"
-        "suggested_boundary_frames 填写新动作开始的帧号（2 到总帧数之间的整数）。"
+        "suggested_boundary_frames 填写新动作开始的CLIP_FRAME帧号（2 到总帧数之间的整数）。"
         "不要把连续切割/清洗的每次往返当成多个动作。不要猜测不可见信息；不确定时写未知并降低 confidence。"
     )}]
     for index, (frame, time_s) in enumerate(zip(frames, frame_times), 1):
+        frame_role = vlm_frame_role(time_s, segment)
         resized = _resize_for_vlm(frame, image_max_side)
         ok, encoded = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, 85])
         if not ok:
             return fallback_annotation(segment, f"第 {index} 帧编码失败")
         content.extend([
-            {"type": "text", "text": f"帧 {index}/{len(frames)}，时间 {time_s:.3f}s"},
+            {
+                "type": "text",
+                "text": (
+                    f"帧 {index}/{len(frames)}，时间 {time_s:.3f}s，[{frame_role}]"
+                ),
+            },
             {"type": "image_url", "image_url": {
                 "url": "data:image/jpeg;base64," + base64.b64encode(encoded.tobytes()).decode("ascii")
             }},
@@ -1089,14 +1099,56 @@ def read_frame_at(video_path: str, time_s: float) -> np.ndarray | None:
     return frame if ok else None
 
 
+def vlm_frame_role(time_s: float, segment: dict[str, Any]) -> str:
+    """Classify a sampled frame as before-context, clip content, or after-context."""
+    # Segment times are rounded to milliseconds while decoded video frames lie
+    # on the source FPS grid. A small tolerance keeps the first/last clip frame
+    # from being mislabeled as context after frame-index rounding.
+    tolerance_s = 0.02
+    if time_s < float(segment["start_s"]) - tolerance_s:
+        return "CONTEXT_BEFORE"
+    if time_s > float(segment["end_s"]) + tolerance_s:
+        return "CONTEXT_AFTER"
+    return "CLIP_FRAME"
+
+
 def sample_segment_frames(
     info: VideoInfo, segment: dict[str, Any], frame_count: int,
+    context_s: float = 0.75,
 ) -> tuple[list[np.ndarray], list[float]]:
+    """Sample a fixed budget with two temporal-context frames on each side.
+
+    With the default budget of 16, an interior clip receives two frames before
+    the segment (-0.75s, -0.25s), twelve uniformly sampled clip frames, and two
+    frames after it (+0.25s, +0.75s). Context frames are caption evidence only;
+    they do not extend the segment or become eligible refinement boundaries.
+    """
+    frame_count = max(1, int(frame_count))
     safe_end = min(segment["end_s"], max(segment["start_s"], info.duration_s - 1.0 / info.fps))
-    duration = max(0.0, safe_end - segment["start_s"])
+    video_safe_end = max(0.0, info.duration_s - 1.0 / info.fps)
+    start_s = float(segment["start_s"])
+    end_s = float(safe_end)
+    context_s = max(0.0, float(context_s))
+    near_context_s = context_s / 3.0
+
+    context_times: list[float] = []
+    if frame_count >= 5 and context_s > 0:
+        context_times = [
+            time_s for time_s in (
+                start_s - context_s,
+                start_s - near_context_s,
+                end_s + near_context_s,
+                end_s + context_s,
+            )
+            if 0.0 <= time_s <= video_safe_end
+        ]
+
+    interior_budget = max(1, frame_count - len(context_times))
+    duration = max(0.0, end_s - start_s)
     available = max(1, int(math.floor(duration * info.fps)) + 1)
-    count = min(max(1, frame_count), available)
-    times = np.linspace(segment["start_s"], safe_end, count).tolist()
+    interior_count = min(interior_budget, available)
+    interior_times = np.linspace(start_s, end_s, interior_count).tolist()
+    times = sorted(context_times + interior_times)
     unique_times: list[float] = []
     seen_frames: set[int] = set()
     for time_s in times:
@@ -1117,7 +1169,9 @@ def annotate_candidate_segment(
         annotation["annotation_source"] = "skipped_no_hand"
         frame_times: list[float] = []
     else:
-        frames, frame_times = sample_segment_frames(info, segment, args.fine_frame_count)
+        frames, frame_times = sample_segment_frames(
+            info, segment, args.fine_frame_count, getattr(args, "vlm_context_s", 0.75),
+        )
         annotation = (
             vlm_annotation(
                 frames, frame_times, segment, args.vlm_api_base, args.vlm_model,
@@ -1125,6 +1179,7 @@ def annotate_candidate_segment(
             ) if frames else fallback_annotation(segment, "无法读取候选片段帧")
         )
     segment["vlm_frame_times_s"] = [round(time_s, 3) for time_s in frame_times]
+    segment["vlm_frame_roles"] = [vlm_frame_role(time_s, segment) for time_s in frame_times]
     segment["semantic_annotation"] = annotation
     segment["caption_zh"] = annotation_caption(annotation)
 
@@ -1184,11 +1239,15 @@ def _refinement_indices(
 ) -> list[dict[str, Any]]:
     annotation = segment["semantic_annotation"]
     frame_times = segment.get("vlm_frame_times_s", [])
+    frame_roles = segment.get("vlm_frame_roles", ["CLIP_FRAME"] * len(frame_times))
     suggested = annotation.get("suggested_boundary_frames", [])
     targets = [
         frame_times[frame_number - 1]
         for frame_number in suggested
-        if 2 <= frame_number <= len(frame_times)
+        if (
+            2 <= frame_number <= len(frame_times)
+            and frame_roles[frame_number - 1] == "CLIP_FRAME"
+        )
     ]
     if not targets:
         targets = [(segment["start_s"] + segment["end_s"]) / 2.0]
@@ -1369,7 +1428,9 @@ def recaption_merged_fine_segments(
     success = 0
     for segment in tqdm(targets, desc="合并长片段重描述", unit="clip"):
         previous = segment["semantic_annotation"]
-        frames, frame_times = sample_segment_frames(info, segment, args.fine_frame_count)
+        frames, frame_times = sample_segment_frames(
+            info, segment, args.fine_frame_count, getattr(args, "vlm_context_s", 0.75),
+        )
         if not frames:
             segment["merged_recaption"] = {
                 "status": "failed", "reason": "无法读取合并后片段帧", "frame_times_s": [],
@@ -1394,6 +1455,7 @@ def recaption_merged_fine_segments(
         segment["merged_recaption"] = {
             "status": "success",
             "frame_times_s": [round(time_s, 3) for time_s in frame_times],
+            "frame_roles": [vlm_frame_role(time_s, segment) for time_s in frame_times],
         }
         success += 1
     return len(targets), success
@@ -1741,6 +1803,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-no-hand-gap-s", type=float, default=1.0, help="有效视频允许的最长双手不可见间隔，默认 1 秒")
     parser.add_argument("--min-export-duration-s", type=float, default=0.5, help="导出有效视频的最短时长，默认 0.5 秒")
     parser.add_argument("--fine-frame-count", type=int, default=16, help="每个候选细片段最多发送给VLM的均匀帧数，默认 16")
+    parser.add_argument(
+        "--vlm-context-s", type=float, default=0.75,
+        help="VLM语义观察在片段前后扩展的最远上下文，默认 0.75 秒；总帧预算不变",
+    )
     parser.add_argument("--merged-recaption-min-duration-s", type=float, default=8.0, help="合并后触发整体重描述的最短片段时长，默认 8 秒")
     parser.add_argument("--vlm-image-max-side", type=int, default=768, help="发送给VLM前的图像最长边，默认 768")
     parser.add_argument("--vlm-api-base", default=None, help="兼容 Chat Completions 的 API 基地址")

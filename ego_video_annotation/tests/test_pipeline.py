@@ -25,10 +25,12 @@ from egoanno.pipeline import (  # noqa: E402
     find_velocity_candidates,
     _refinement_indices,
     normalize_annotation,
+    sample_segment_frames,
     segment_record,
     spans_from_boundaries,
     recaption_merged_fine_segments,
     VideoInfo,
+    vlm_frame_role,
 )
 
 
@@ -40,6 +42,36 @@ def detected_hand(side: str, x: float, score: float = 0.9) -> dict:
         "landmarks_2d_relative": [{"x": x, "y": 0.5, "z": 0.0} for _ in range(21)],
         "landmarks_3d_relative": None,
     }
+
+
+class VLMContextSamplingTests(unittest.TestCase):
+    def test_sixteen_frame_budget_includes_two_context_frames_per_side(self) -> None:
+        info = VideoInfo("dummy.mp4", 30.0, 600, 1920, 1080, 20.0)
+        segment = {"start_s": 5.0, "end_s": 9.0}
+        dummy = np.zeros((2, 2, 3), dtype=np.uint8)
+        with patch("egoanno.pipeline.read_frame_at", return_value=dummy):
+            frames, times = sample_segment_frames(info, segment, 16, context_s=0.75)
+
+        roles = [vlm_frame_role(time_s, segment) for time_s in times]
+        self.assertEqual(len(frames), 16)
+        self.assertEqual(len(times), 16)
+        self.assertEqual(roles.count("CONTEXT_BEFORE"), 2)
+        self.assertEqual(roles.count("CLIP_FRAME"), 12)
+        self.assertEqual(roles.count("CONTEXT_AFTER"), 2)
+        self.assertEqual(times, sorted(times))
+
+    def test_video_edge_uses_remaining_budget_for_clip_frames(self) -> None:
+        info = VideoInfo("dummy.mp4", 30.0, 300, 1920, 1080, 10.0)
+        segment = {"start_s": 0.0, "end_s": 2.0}
+        dummy = np.zeros((2, 2, 3), dtype=np.uint8)
+        with patch("egoanno.pipeline.read_frame_at", return_value=dummy):
+            _, times = sample_segment_frames(info, segment, 16, context_s=0.75)
+
+        roles = [vlm_frame_role(time_s, segment) for time_s in times]
+        self.assertEqual(len(times), 16)
+        self.assertEqual(roles.count("CONTEXT_BEFORE"), 0)
+        self.assertEqual(roles.count("CONTEXT_AFTER"), 2)
+        self.assertEqual(roles.count("CLIP_FRAME"), 14)
 
 
 class HandIdentityTests(unittest.TestCase):
