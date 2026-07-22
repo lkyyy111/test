@@ -443,6 +443,71 @@ def _render_retarget(
         renderer.close()
 
 
+def combine_retarget_videos(
+    left_video: Path, right_video: Path, output: Path,
+) -> dict[str, Any]:
+    """Write a synchronized side-by-side view of two independent Frankas."""
+    left_cap = cv2.VideoCapture(str(left_video))
+    right_cap = cv2.VideoCapture(str(right_video))
+    if not left_cap.isOpened() or not right_cap.isOpened():
+        left_cap.release()
+        right_cap.release()
+        raise RuntimeError("unable to open left/right Franka videos for composition")
+
+    left_fps = float(left_cap.get(cv2.CAP_PROP_FPS))
+    right_fps = float(right_cap.get(cv2.CAP_PROP_FPS))
+    fps = min(value for value in (left_fps, right_fps) if value > 0)
+    width = max(
+        int(left_cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        int(right_cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+    )
+    height = max(
+        int(left_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        int(right_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+    )
+    writer = cv2.VideoWriter(
+        str(output), cv2.VideoWriter_fourcc(*"mp4v"), fps, (2 * width, height),
+    )
+    if not writer.isOpened():
+        left_cap.release()
+        right_cap.release()
+        raise RuntimeError(f"unable to create bimanual Franka video: {output}")
+
+    frame_count = 0
+    try:
+        while True:
+            left_ok, left_frame = left_cap.read()
+            right_ok, right_frame = right_cap.read()
+            if not left_ok and not right_ok:
+                break
+            if not left_ok:
+                left_frame = np.zeros((height, width, 3), dtype=np.uint8)
+            if not right_ok:
+                right_frame = np.zeros((height, width, 3), dtype=np.uint8)
+            left_frame = cv2.resize(left_frame, (width, height))
+            right_frame = cv2.resize(right_frame, (width, height))
+            cv2.putText(
+                left_frame, "LEFT HAND -> FRANKA", (18, height - 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA,
+            )
+            cv2.putText(
+                right_frame, "RIGHT HAND -> FRANKA", (18, height - 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA,
+            )
+            writer.write(cv2.hconcat([left_frame, right_frame]))
+            frame_count += 1
+    finally:
+        writer.release()
+        left_cap.release()
+        right_cap.release()
+    return {
+        "fps": fps,
+        "frame_count": frame_count,
+        "width": 2 * width,
+        "height": height,
+    }
+
+
 def run_franka_retarget(
     info: Any,
     samples: list[dict[str, Any]],

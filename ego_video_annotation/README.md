@@ -108,9 +108,9 @@ python run_pipeline.py \
 
 MediaPipe 的 `x/y` 是图像归一化坐标，`z` 是相对深度；CSV 中 `world_x/y/z` 仍是 MediaPipe 的相对手部坐标，不是经过相机标定的米制世界坐标。当前速度使用背景仿射运动补偿后的二维掌心位移，适合本次轻量测试，但不等价于 VITRA 的完整世界坐标轨迹。
 
-## 可选 Franka retarget（short1）
+## 可选 Franka retarget（short1 / short2）
 
-Franka retarget 是完全可选的第四阶段。默认不导入 MuJoCo，因此 long1 的安装方式、标注逻辑和输出保持不变。short1 使用整段右手腕轨迹，在固定前向距离的竖直平面中映射左右与抬放运动，再通过阻尼最小二乘 IK 和 Panda 位置执行器回放。
+Franka retarget 是完全可选的第四阶段。默认不导入 MuJoCo，因此 long1 的安装方式、标注逻辑和输出保持不变。short1 使用整段右手腕轨迹；short2 使用左右手轨迹分别驱动两个独立的 Franka，并在同一个时间轴上生成并排回放。每只手都在自己的固定前向竖直平面中映射左右与抬放运动，再通过阻尼最小二乘 IK 和 Panda 位置执行器回放。双手模式保留时间同步，但不建模两手之间的米制距离、双臂碰撞或协同约束。
 
 安装可选依赖：
 
@@ -142,6 +142,18 @@ python run_pipeline.py \
   --retarget-hand right
 ```
 
+short2 双手完整运行：
+
+```bash
+python run_pipeline.py \
+  --video ../data/short2.mp4 \
+  --output outputs/short2_franka \
+  --vlm-api-base "$VLM_API_BASE" \
+  --vlm-model "$VLM_MODEL" \
+  --retarget-franka \
+  --retarget-hand both
+```
+
 如果只想验证 IK 和 CSV，不生成任何 MP4，可额外添加 `--skip-video-outputs`。retarget 结果写入 `franka_retarget/`：
 
 - `target_trajectory.csv`：由右手腕图像轨迹映射得到的末端目标。
@@ -149,5 +161,10 @@ python run_pipeline.py \
 - `achieved_trajectory.csv`：实际末端轨迹和逐时刻误差。
 - `retarget_metrics.json`：轨迹覆盖率、IK 与动力学跟踪误差。
 - `retarget.mp4`：Franka 回放；蓝色小球是当前目标点。
+
+双手模式在 `franka_retarget/left/` 和 `franka_retarget/right/` 下分别生成以上文件，并额外输出：
+
+- `retarget_summary.json`：左右手覆盖率、IK/仿真误差和双手模式说明。
+- `retarget_both.mp4`：左右两个独立 Franka 的同步并排回放。
 
 long1 继续使用原命令，不添加 `--retarget-franka`。也不要根据文件名或时长自动启用 retarget；该开关由调用者显式控制。

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 
@@ -11,7 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from egoanno.pipeline import build_parser  # noqa: E402
-from egoanno.retarget_franka import RetargetConfig, build_short_lift_targets  # noqa: E402
+from egoanno.retarget_franka import (  # noqa: E402
+    RetargetConfig,
+    build_short_lift_targets,
+    combine_retarget_videos,
+)
 
 
 def sample(time_s: float, right_xy: tuple[float, float] | None) -> dict:
@@ -65,6 +71,37 @@ class ShortLiftTargetTests(unittest.TestCase):
         args = build_parser().parse_args(["--video", "long1.mp4", "--output", "out"])
         self.assertFalse(args.retarget_franka)
         self.assertEqual(args.retarget_hand, "right")
+
+    def test_bimanual_retarget_option_is_available_for_short2(self) -> None:
+        args = build_parser().parse_args([
+            "--video", "short2.mp4", "--output", "out",
+            "--retarget-franka", "--retarget-hand", "both",
+        ])
+        self.assertTrue(args.retarget_franka)
+        self.assertEqual(args.retarget_hand, "both")
+
+    def test_two_single_arm_videos_can_be_composed_side_by_side(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            left_path = root / "left.mp4"
+            right_path = root / "right.mp4"
+            for path, color in ((left_path, (255, 0, 0)), (right_path, (0, 255, 0))):
+                writer = cv2.VideoWriter(
+                    str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (160, 120),
+                )
+                self.assertTrue(writer.isOpened())
+                for _ in range(3):
+                    writer.write(np.full((120, 160, 3), color, dtype=np.uint8))
+                writer.release()
+
+            output = root / "both.mp4"
+            metadata = combine_retarget_videos(left_path, right_path, output)
+            cap = cv2.VideoCapture(str(output))
+            self.assertTrue(cap.isOpened())
+            self.assertEqual(int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), 320)
+            self.assertEqual(int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), 120)
+            cap.release()
+            self.assertEqual(metadata["frame_count"], 3)
 
 
 if __name__ == "__main__":

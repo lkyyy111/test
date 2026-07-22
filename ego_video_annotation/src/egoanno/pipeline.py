@@ -1758,19 +1758,64 @@ def run(args: argparse.Namespace) -> None:
         print("[info] 按最终细粒度边界导出有效操作片段…")
         write_valid_clips(info, fine, output / "valid_segments")
     if getattr(args, "retarget_franka", False):
-        print(f"[info] 将整段 {args.retarget_hand} 手轨迹映射到 Franka…")
         # Lazy import keeps MuJoCo and the Franka model optional. Long-video
         # annotation runs are unchanged when --retarget-franka is absent.
-        from egoanno.retarget_franka import run_franka_retarget
+        from egoanno.retarget_franka import combine_retarget_videos, run_franka_retarget
 
-        retarget_metrics = run_franka_retarget(
-            info, samples, output / "franka_retarget", args,
-        )
-        print(
-            "[info] Franka retarget 完成："
-            f"IK RMSE={retarget_metrics['ik']['position_rmse_m']:.4f}m；"
-            f"仿真 RMSE={retarget_metrics['simulation']['position_rmse_m']:.4f}m"
-        )
+        retarget_root = output / "franka_retarget"
+        if args.retarget_hand == "both":
+            metrics_by_hand: dict[str, Any] = {}
+            for side in HAND_SIDES:
+                print(f"[info] 将整段 {side} 手轨迹映射到独立 Franka…")
+                side_args = argparse.Namespace(**vars(args))
+                side_args.retarget_hand = side
+                metrics = run_franka_retarget(
+                    info, samples, retarget_root / side, side_args,
+                )
+                metrics_by_hand[side] = metrics
+                print(
+                    f"[info] {side} Franka 完成："
+                    f"IK RMSE={metrics['ik']['position_rmse_m']:.4f}m；"
+                    f"仿真 RMSE={metrics['simulation']['position_rmse_m']:.4f}m"
+                )
+            combined_video = None
+            combined_video_info = None
+            if not args.skip_video_outputs:
+                combined_video = "retarget_both.mp4"
+                print("[info] 合成同步双手 Franka 并排视频…")
+                combined_video_info = combine_retarget_videos(
+                    retarget_root / "left" / "retarget.mp4",
+                    retarget_root / "right" / "retarget.mp4",
+                    retarget_root / combined_video,
+                )
+            summary = {
+                "schema_version": "0.1",
+                "profile": "short_bimanual_two_independent_frankas",
+                "source_video": str(info.path),
+                "hands": list(HAND_SIDES),
+                "shared_timebase": True,
+                "spatial_mapping": (
+                    "Each hand is normalized independently into its own Franka vertical plane; "
+                    "timing is synchronized, but inter-hand metric distance and collisions are not modeled."
+                ),
+                "results": metrics_by_hand,
+                "rendered_video": combined_video,
+                "rendered_video_info": combined_video_info,
+            }
+            retarget_root.mkdir(parents=True, exist_ok=True)
+            (retarget_root / "retarget_summary.json").write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+        else:
+            print(f"[info] 将整段 {args.retarget_hand} 手轨迹映射到 Franka…")
+            retarget_metrics = run_franka_retarget(
+                info, samples, retarget_root, args,
+            )
+            print(
+                "[info] Franka retarget 完成："
+                f"IK RMSE={retarget_metrics['ik']['position_rmse_m']:.4f}m；"
+                f"仿真 RMSE={retarget_metrics['simulation']['position_rmse_m']:.4f}m"
+            )
     print(
         f"[done] 最终细片段：{len(fine)}；标注输出：{len(clean_annotations['clips'])}；"
         f"有效视频：{len(valid_ids)}；待复核：{len(review_queue)}；结果目录：{output}"
@@ -1815,11 +1860,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-video-outputs", action="store_true", help="仅输出 JSON/CSV，不生成 MP4")
     parser.add_argument(
         "--retarget-franka", action="store_true",
-        help="可选：将整段单手轨迹映射到 MuJoCo Franka；默认关闭，不影响 long1",
+        help="可选：将整段单手或双手轨迹映射到 MuJoCo Franka；默认关闭，不影响 long1",
     )
     parser.add_argument(
-        "--retarget-hand", choices=("left", "right"), default="right",
-        help="Franka 跟随的操作手，short1 使用 right",
+        "--retarget-hand", choices=("left", "right", "both"), default="right",
+        help="Franka 跟随的操作手；short1 使用 right，short2 使用 both",
     )
     parser.add_argument(
         "--retarget-control-fps", type=float, default=50.0,
