@@ -24,11 +24,6 @@ import requests
 from tqdm import tqdm
 
 
-HAND_CONNECTIONS = (
-    (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
-    (5, 9), (9, 10), (10, 11), (11, 12), (9, 13), (13, 14), (14, 15),
-    (15, 16), (13, 17), (0, 17), (17, 18), (18, 19), (19, 20),
-)
 HAND_SIDES = ("left", "right")
 PALM_LANDMARKS = (0, 5, 9, 13, 17)
 CAMERA_MOTION_SIZE = (320, 180)
@@ -1568,36 +1563,172 @@ def write_trajectories(samples: list[dict[str, Any]], output: Path) -> None:
                 })
 
 
-def draw_hand(frame: np.ndarray, hand: dict[str, Any]) -> None:
-    height, width = frame.shape[:2]
-    pixel = [(int(p["x"] * width), int(p["y"] * height)) for p in hand["landmarks_2d_relative"]]
-    color = (38, 214, 120) if hand["side"] == "right" else (255, 170, 40)
-    for a, b in HAND_CONNECTIONS:
-        cv2.line(frame, pixel[a], pixel[b], color, 2, cv2.LINE_AA)
-    for point in pixel:
-        cv2.circle(frame, point, 3, color, -1, cv2.LINE_AA)
-    cv2.putText(frame, hand["side"], pixel[0], cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+def annotation_at_time(clips: list[dict[str, Any]], time_s: float) -> dict[str, Any] | None:
+    """Return the compact annotation active in the half-open time interval."""
+    for clip in clips:
+        if float(clip["start_s"]) <= time_s < float(clip["end_s"]):
+            return clip
+        if float(clip["start_s"]) > time_s:
+            break
+    return None
 
 
-def write_overlay(info: VideoInfo, samples: list[dict[str, Any]], output: Path) -> None:
-    lookup = {sample["frame_index"]: sample["hands"] for sample in samples}
+def _resolve_subtitle_font(explicit: str | None) -> Path:
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    environment_font = os.getenv("EGOANNO_SUBTITLE_FONT")
+    if environment_font:
+        candidates.append(Path(environment_font).expanduser())
+    candidates.extend([
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf"),
+        Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
+        Path("/usr/share/fonts/truetype/arphic/ukai.ttc"),
+        Path(r"C:\Windows\Fonts\msyh.ttc"),
+        Path(r"C:\Windows\Fonts\simhei.ttf"),
+    ])
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError(
+        "未找到可显示中文的字幕字体。Linux可执行 `apt-get install -y fonts-noto-cjk`，"
+        "或通过 --subtitle-font /path/to/font.ttf 指定字体。"
+    )
+
+
+def _wrap_subtitle_text(draw: Any, text: str, font: Any, max_width: int, max_lines: int = 3) -> list[str]:
+    lines: list[str] = []
+    current = ""
+    for character in str(text).strip():
+        candidate = current + character
+        width = draw.textbbox((0, 0), candidate, font=font, stroke_width=1)[2]
+        if current and width > max_width:
+            lines.append(current)
+            current = character
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    if len(lines) <= max_lines:
+        return lines or [""]
+    lines = lines[:max_lines]
+    last = lines[-1]
+    while last and draw.textbbox((0, 0), last + "…", font=font, stroke_width=1)[2] > max_width:
+        last = last[:-1]
+    lines[-1] = last + "…"
+    return lines
+
+
+def _subtitle_panel(
+    width: int, text: str, quality_status: str, font_path: Path, font_size: int,
+) -> np.ndarray:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as error:
+        raise RuntimeError("生成中文字幕视频需要 Pillow；请重新执行 pip install -r requirements.txt") from error
+
+    margin = max(18, round(width * 0.035))
+    padding_x = max(20, round(width * 0.020))
+    padding_y = max(12, round(font_size * 0.45))
+    panel_width = width - 2 * margin
+    font = ImageFont.truetype(str(font_path), font_size)
+    probe = Image.new("RGBA", (panel_width, max(64, font_size * 5)), (0, 0, 0, 0))
+    probe_draw = ImageDraw.Draw(probe)
+    prefix = "【待复核】" if quality_status == "review" else ""
+    lines = _wrap_subtitle_text(
+        probe_draw, prefix + str(text), font, panel_width - 2 * padding_x,
+    )
+    line_spacing = max(5, round(font_size * 0.22))
+    line_height = max(
+        font_size,
+        probe_draw.textbbox((0, 0), "中文Ag", font=font, stroke_width=1)[3],
+    )
+    panel_height = 2 * padding_y + len(lines) * line_height + (len(lines) - 1) * line_spacing
+    panel = Image.new("RGBA", (panel_width, panel_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(panel)
+    draw.rounded_rectangle(
+        (0, 0, panel_width - 1, panel_height - 1),
+        radius=max(12, round(font_size * 0.45)), fill=(0, 0, 0, 178),
+        outline=(255, 255, 255, 55), width=1,
+    )
+    y = padding_y
+    text_color = (255, 218, 110, 255) if quality_status == "review" else (255, 255, 255, 255)
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font, stroke_width=1)
+        x = max(padding_x, (panel_width - (bbox[2] - bbox[0])) // 2)
+        draw.text(
+            (x, y), line, font=font, fill=text_color,
+            stroke_width=1, stroke_fill=(0, 0, 0, 210),
+        )
+        y += line_height + line_spacing
+    return np.asarray(panel)
+
+
+def _blend_subtitle_panel(frame: np.ndarray, panel: np.ndarray, bottom_margin: int) -> None:
+    frame_height, frame_width = frame.shape[:2]
+    panel_height, panel_width = panel.shape[:2]
+    x = max(0, (frame_width - panel_width) // 2)
+    y = max(0, frame_height - bottom_margin - panel_height)
+    roi = frame[y:y + panel_height, x:x + panel_width]
+    alpha = panel[:, :, 3:4].astype(np.float32) / 255.0
+    panel_bgr = panel[:, :, :3][:, :, ::-1].astype(np.float32)
+    roi[:] = (panel_bgr * alpha + roi.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
+
+
+def write_annotated_video(
+    info: VideoInfo, annotations: dict[str, Any], output: Path,
+    subtitle_font: str | None = None, subtitle_font_size: int = 0,
+) -> None:
+    """Render compact annotations as timed Chinese subtitles on the full video."""
+    clips = sorted(annotations.get("clips", []), key=lambda item: float(item["start_s"]))
+    font_path = _resolve_subtitle_font(subtitle_font)
+    font_size = subtitle_font_size if subtitle_font_size > 0 else max(24, round(info.height * 0.033))
+    bottom_margin = max(22, round(info.height * 0.045))
     cap = cv2.VideoCapture(info.path)
-    writer = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*"mp4v"), info.fps, (info.width, info.height))
+    writer = cv2.VideoWriter(
+        str(output), cv2.VideoWriter_fourcc(*"mp4v"), info.fps, (info.width, info.height),
+    )
     if not cap.isOpened() or not writer.isOpened():
         cap.release()
         writer.release()
-        raise RuntimeError(f"无法创建骨架叠加视频：{output}")
-    frame_index = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        for hand in lookup.get(frame_index, []):
-            draw_hand(frame, hand)
-        writer.write(frame)
-        frame_index += 1
-    cap.release()
-    writer.release()
+        raise RuntimeError(f"无法创建字幕标注视频：{output}")
+
+    active_id: str | None = None
+    active_panel: np.ndarray | None = None
+    clip_index = 0
+    try:
+        with tqdm(total=info.frame_count, desc="字幕标注视频", unit="frame") as progress:
+            for frame_index in range(info.frame_count):
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                time_s = frame_index / info.fps
+                while clip_index < len(clips) and time_s >= float(clips[clip_index]["end_s"]):
+                    clip_index += 1
+                clip = (
+                    clips[clip_index]
+                    if clip_index < len(clips)
+                    and float(clips[clip_index]["start_s"]) <= time_s < float(clips[clip_index]["end_s"])
+                    else None
+                )
+                clip_id = str(clip["id"]) if clip else None
+                if clip_id != active_id:
+                    active_id = clip_id
+                    active_panel = (
+                        _subtitle_panel(
+                            info.width, str(clip.get("caption") or "未知动作"),
+                            str(clip.get("quality_status") or "accepted"), font_path, font_size,
+                        )
+                        if clip else None
+                    )
+                if active_panel is not None:
+                    _blend_subtitle_panel(frame, active_panel, bottom_margin)
+                writer.write(frame)
+                progress.update(1)
+    finally:
+        cap.release()
+        writer.release()
 
 
 def write_valid_clips(info: VideoInfo, segments: list[dict[str, Any]], output_dir: Path) -> None:
@@ -1753,8 +1884,11 @@ def run(args: argparse.Namespace) -> None:
     (output / "hand_landmarks.json").write_text(json.dumps(samples, ensure_ascii=False, indent=2), encoding="utf-8")
     write_trajectories(samples, output / "wrist_trajectories.csv")
     if not args.skip_video_outputs:
-        print("[info] 写入骨架叠加视频…")
-        write_overlay(info, samples, output / "hand_overlay.mp4")
+        print("[info] 根据 annotations.json 写入字幕标注视频…")
+        write_annotated_video(
+            info, clean_annotations, output / "annotated_video.mp4",
+            args.subtitle_font, args.subtitle_font_size,
+        )
         print("[info] 按最终细粒度边界导出有效操作片段…")
         write_valid_clips(info, fine, output / "valid_segments")
     if getattr(args, "retarget_franka", False):
@@ -1858,6 +1992,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vlm-model", default=None, help="视觉语言模型名称；密钥从 VLM_API_KEY 读取")
     parser.add_argument("--review-confidence", type=float, default=0.65, help="低于该VLM置信度的有效片段进入复核队列")
     parser.add_argument("--skip-video-outputs", action="store_true", help="仅输出 JSON/CSV，不生成 MP4")
+    parser.add_argument(
+        "--subtitle-font", default=None,
+        help="中文字幕字体文件；默认自动查找 Noto CJK、文泉驿或微软雅黑",
+    )
+    parser.add_argument(
+        "--subtitle-font-size", type=int, default=0,
+        help="字幕字号；0 表示根据视频高度自动选择",
+    )
     parser.add_argument(
         "--retarget-franka", action="store_true",
         help="可选：将整段单手或双手轨迹映射到 MuJoCo Franka；默认关闭，不影响 long1",

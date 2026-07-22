@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from egoanno.pipeline import (  # noqa: E402
     _long_no_hand_boundaries,
     HandIdentityTracker,
+    annotation_at_time,
     annotate_hand_validity,
     attach_hand_motion,
     build_clean_annotations,
@@ -72,6 +73,19 @@ class VLMContextSamplingTests(unittest.TestCase):
         self.assertEqual(roles.count("CONTEXT_BEFORE"), 0)
         self.assertEqual(roles.count("CONTEXT_AFTER"), 2)
         self.assertEqual(roles.count("CLIP_FRAME"), 14)
+
+
+class AnnotationSubtitleTests(unittest.TestCase):
+    def test_annotation_lookup_uses_half_open_intervals(self) -> None:
+        clips = [
+            {"id": "fine_001", "start_s": 1.0, "end_s": 2.0},
+            {"id": "fine_002", "start_s": 2.0, "end_s": 3.0},
+        ]
+        self.assertIsNone(annotation_at_time(clips, 0.999))
+        self.assertEqual(annotation_at_time(clips, 1.0)["id"], "fine_001")
+        self.assertEqual(annotation_at_time(clips, 1.999)["id"], "fine_001")
+        self.assertEqual(annotation_at_time(clips, 2.0)["id"], "fine_002")
+        self.assertIsNone(annotation_at_time(clips, 3.0))
 
 
 class HandIdentityTests(unittest.TestCase):

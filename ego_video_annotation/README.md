@@ -48,6 +48,15 @@ conda activate egoanno
 pip install -r requirements.txt
 ```
 
+Linux服务器生成中文字幕视频还需要中文字体；如果系统没有，可安装：
+
+```bash
+apt-get update
+apt-get install -y fonts-noto-cjk
+```
+
+也可以使用 `--subtitle-font /path/to/font.ttf` 指定已有字体。
+
 当前基础管线不依赖 PyTorch；MediaPipe 和 OpenCV 可在 CPU 上运行，外部 VLM API 不占用本地显存。
 
 ## 运行
@@ -98,7 +107,7 @@ python run_pipeline.py \
 - `annotations_diagnostics.json`：完整运行诊断，包括参数、候选与删除边界、全部有效/无效细片段、合并与重描述历史以及复核队列。
 - `hand_landmarks.json`：每个采样时刻的左右手 21 点、有效性 mask、相机补偿质量和速度。
 - `wrist_trajectories.csv`：每个采样时刻固定输出左右手各一行；缺失手的真实坐标为空，并另外记录边界专用掌心、`motion_source`、权重和插值 mask。
-- `hand_overlay.mp4`：采样帧的手部骨架叠加。
+- `annotated_video.mp4`：保持原视频时间轴，根据 `annotations.json` 的 `[start_s, end_s)` 在对应区间显示中文caption；`review`片段使用“待复核”标记。当前不再生成骨架overlay视频。
 - `valid_segments/`：按最终细粒度片段导出的有效操作视频。
 
 相邻片段使用半开时间区间 `[start_s, end_s)`，因此不会再因为最后一个采样时间而固定漏掉一段视频。
