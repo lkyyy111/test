@@ -117,9 +117,11 @@ python run_pipeline.py \
 
 MediaPipe 的 `x/y` 是图像归一化坐标，`z` 是相对深度；CSV 中 `world_x/y/z` 仍是 MediaPipe 的相对手部坐标，不是经过相机标定的米制世界坐标。当前速度使用背景仿射运动补偿后的二维掌心位移，适合本次轻量测试，但不等价于 VITRA 的完整世界坐标轨迹。
 
-## 可选 Franka retarget（short1 / short2）
+## 可选第一人称灵巧手 retarget（short1 / short2）
 
-Franka retarget 是完全可选的第四阶段。默认不导入 MuJoCo，因此 long1 的安装方式、标注逻辑和输出保持不变。short1 使用整段右手腕轨迹；short2 使用左右手轨迹分别驱动两个独立的 Franka，并在同一个时间轴上生成并排回放。每只手都在自己的固定前向竖直平面中映射左右与抬放运动，再通过阻尼最小二乘 IK 和 Panda 位置执行器回放。双手模式保留时间同步，但不建模两手之间的米制距离、双臂碰撞或协同约束。
+灵巧手 retarget 是完全可选的第四阶段。默认不导入 MuJoCo，因此 long1 的安装方式、标注逻辑和输出保持不变。该模块把 MediaPipe 的五指21点转换为每根手指的外展角和 MCP/PIP/DIP 屈曲角，共20个关节自由度；腕部画面位置控制左右和上下移动，手掌画面尺度的相对变化近似控制向前伸出或收回。这里的前后运动是有界的相对深度，不是标定后的米制深度。
+
+short1 驱动一个右手模型；short2 分别驱动左右手模型，并在同一个时间轴上生成并排的第一人称回放。双手模式保留时间同步，但不恢复两手之间的真实距离、接触或碰撞。
 
 安装可选依赖：
 
@@ -127,11 +129,7 @@ Franka retarget 是完全可选的第四阶段。默认不导入 MuJoCo，因此
 pip install -r requirements-retarget.txt
 ```
 
-`robot_descriptions` 会提供 MuJoCo Menagerie 的 Panda MJCF。也可以自行克隆 Menagerie 并设置：
-
-```bash
-export MUJOCO_MENAGERIE_PATH="$HOME/mujoco_menagerie"
-```
+灵巧手 MJCF 由程序直接生成，不需要下载 MuJoCo Menagerie 或 Panda 模型。
 
 无显示器的 Linux 服务器建议在启动 Python 前启用 EGL：
 
@@ -144,10 +142,10 @@ short1 完整运行：
 ```bash
 python run_pipeline.py \
   --video ../data/short1.mp4 \
-  --output outputs/short1_franka \
+  --output outputs/short1_dexhand \
   --vlm-api-base "$VLM_API_BASE" \
   --vlm-model "$VLM_MODEL" \
-  --retarget-franka \
+  --retarget-dex-hand \
   --retarget-hand right
 ```
 
@@ -156,24 +154,24 @@ short2 双手完整运行：
 ```bash
 python run_pipeline.py \
   --video ../data/short2.mp4 \
-  --output outputs/short2_franka \
+  --output outputs/short2_dexhand \
   --vlm-api-base "$VLM_API_BASE" \
   --vlm-model "$VLM_MODEL" \
-  --retarget-franka \
+  --retarget-dex-hand \
   --retarget-hand both
 ```
 
-如果只想验证 IK 和 CSV，不生成任何 MP4，可额外添加 `--skip-video-outputs`。retarget 结果写入 `franka_retarget/`：
+如果只想验证21点转换和 CSV、不生成任何 MP4，可额外添加 `--skip-video-outputs`。retarget 结果写入 `dex_hand_retarget/`：
 
-- `target_trajectory.csv`：由右手腕图像轨迹映射得到的末端目标。
-- `joint_trajectory.csv`：仿真后的 Franka 七关节轨迹。
-- `achieved_trajectory.csv`：实际末端轨迹和逐时刻误差。
-- `retarget_metrics.json`：轨迹覆盖率、IK 与动力学跟踪误差。
-- `retarget.mp4`：Franka 回放；蓝色小球是当前目标点。
+- `dex_hand_model.xml`：自包含的五指20自由度 MuJoCo 模型。
+- `root_trajectory.csv`：50 Hz 腕部三维根轨迹、图像坐标、手掌尺度和有效性 mask。
+- `joint_trajectory.csv`：50 Hz 的20个灵巧手关节目标。
+- `retarget_metrics.json`：观测覆盖率、有效控制点比例和相对深度映射范围。
+- `retarget.mp4`：固定第一人称相机下的灵巧手回放。
 
-双手模式在 `franka_retarget/left/` 和 `franka_retarget/right/` 下分别生成以上文件，并额外输出：
+双手模式在 `dex_hand_retarget/left/` 和 `dex_hand_retarget/right/` 下分别生成以上文件，并额外输出：
 
-- `retarget_summary.json`：左右手覆盖率、IK/仿真误差和双手模式说明。
-- `retarget_both.mp4`：左右两个独立 Franka 的同步并排回放。
+- `retarget_summary.json`：左右手覆盖率和双手模式说明。
+- `retarget_both.mp4`：左右灵巧手的同步并排第一人称回放。
 
-long1 继续使用原命令，不添加 `--retarget-franka`。也不要根据文件名或时长自动启用 retarget；该开关由调用者显式控制。
+long1 继续使用原命令，不添加 `--retarget-dex-hand`。也不会根据文件名或时长自动启用 retarget；该开关由调用者显式控制。旧的 `--retarget-franka` 暂时保留为同一功能的兼容别名，但不会再生成 Franka 机械臂。
