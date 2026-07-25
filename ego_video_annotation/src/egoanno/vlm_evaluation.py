@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from statistics import median
 from typing import Any, Callable
@@ -66,6 +67,9 @@ class JudgeConfig:
     context_s: float = 0.75
     boundary_frame_count: int = 8
     max_pair_gap_s: float = 0.25
+    max_output_tokens: int = 2048
+    max_retries: int = 2
+    retry_backoff_s: float = 2.0
 
 
 class JudgeError(RuntimeError):
@@ -152,7 +156,7 @@ class ResponsesJudge:
             "model": self.config.model,
             "reasoning": {"effort": self.config.reasoning_effort},
             "input": [{"role": "user", "content": content}],
-            "max_output_tokens": 768,
+            "max_output_tokens": self.config.max_output_tokens,
             "store": False,
             "text": {
                 "format": {
@@ -163,53 +167,114 @@ class ResponsesJudge:
                 }
             },
         }
-        url = self.config.api_base.rstrip("/") + "/responses"
-        headers = {"Authorization": f"Bearer {self.config.api_key}"}
-        try:
-            response = self.session.post(
-                url, headers=headers, json=body, timeout=self.config.timeout_s,
-            )
-        except requests.RequestException as error:
-            raise JudgeError(f"裁判API连接失败：{error}") from error
-
-        # Some OpenAI-compatible gateways implement Responses multimodal input
-        # before implementing strict structured output.  Prefer json_schema,
-        # but fall back to prompt-constrained JSON for those gateways.
-        if getattr(response, "status_code", None) in {400, 404, 422}:
-            fallback_body = dict(body)
-            fallback_body.pop("text", None)
-            fallback_body["input"] = [{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": "严格只输出一个JSON对象，不要Markdown代码块。",
-                    },
-                    *content,
-                ],
-            }]
-            try:
-                response = self.session.post(
-                    url, headers=headers, json=fallback_body,
-                    timeout=self.config.timeout_s,
-                )
-            except requests.RequestException as error:
-                raise JudgeError(f"裁判API兼容模式连接失败：{error}") from error
-        try:
-            response.raise_for_status()
-        except requests.RequestException as error:
-            detail = getattr(response, "text", "")[:1000]
-            raise JudgeError(f"裁判API请求失败：{error}；{detail}") from error
-        try:
-            payload = response.json()
-        except (ValueError, TypeError) as error:
-            raise JudgeError("裁判API返回的不是JSON") from error
-        if payload.get("status") not in {None, "completed"} or payload.get("error"):
-            raise JudgeError(f"裁判API状态异常：{payload.get('status')} / {payload.get('error')}")
+        payload = self._request(body, content)
         result = _parse_json_text(_response_output_text(payload))
         normalized = {key: _normalized_score(result.get(key), key) for key in score_keys}
         normalized["evidence"] = str(result.get("evidence") or "").strip()
         return normalized
+
+    def _retry(self, reason: str, attempt: int) -> None:
+        if attempt >= self.config.max_retries:
+            return
+        delay = self.config.retry_backoff_s * (2 ** attempt)
+        tqdm.write(
+            f"[warning] {reason}；{delay:.1f}s 后重试 "
+            f"({attempt + 1}/{self.config.max_retries})"
+        )
+        if delay > 0:
+            time.sleep(delay)
+
+    def _request(
+        self, body: dict[str, Any], content: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        url = self.config.api_base.rstrip("/") + "/responses"
+        headers = {"Authorization": f"Bearer {self.config.api_key}"}
+        last_reason = "未知错误"
+        last_error: Exception | None = None
+
+        for attempt in range(self.config.max_retries + 1):
+            try:
+                response = self.session.post(
+                    url, headers=headers, json=body, timeout=self.config.timeout_s,
+                )
+            except requests.RequestException as error:
+                last_error = error
+                last_reason = f"裁判API连接失败：{error}"
+                if attempt < self.config.max_retries:
+                    self._retry(last_reason, attempt)
+                    continue
+                raise JudgeError(last_reason) from error
+
+            # Some compatible gateways support Responses multimodal input but
+            # not strict json_schema output. Fall back only for format errors.
+            if getattr(response, "status_code", None) in {400, 404, 422}:
+                fallback_body = dict(body)
+                fallback_body.pop("text", None)
+                fallback_body["input"] = [{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "严格只输出一个JSON对象，不要Markdown代码块。",
+                    }, *content],
+                }]
+                try:
+                    response = self.session.post(
+                        url, headers=headers, json=fallback_body,
+                        timeout=self.config.timeout_s,
+                    )
+                except requests.RequestException as error:
+                    last_error = error
+                    last_reason = f"裁判API兼容模式连接失败：{error}"
+                    if attempt < self.config.max_retries:
+                        self._retry(last_reason, attempt)
+                        continue
+                    raise JudgeError(last_reason) from error
+
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if status_code == 429 or status_code >= 500:
+                detail = getattr(response, "text", "")[:1000]
+                last_reason = f"裁判API暂时错误：HTTP {status_code}；{detail}"
+                if attempt < self.config.max_retries:
+                    self._retry(last_reason, attempt)
+                    continue
+            try:
+                response.raise_for_status()
+            except requests.RequestException as error:
+                detail = getattr(response, "text", "")[:1000]
+                raise JudgeError(f"裁判API请求失败：{error}；{detail}") from error
+            try:
+                payload = response.json()
+            except (ValueError, TypeError) as error:
+                last_error = error
+                last_reason = "裁判API返回的不是JSON"
+                if attempt < self.config.max_retries:
+                    self._retry(last_reason, attempt)
+                    continue
+                raise JudgeError(last_reason) from error
+
+            status = payload.get("status")
+            api_error = payload.get("error")
+            incomplete_details = payload.get("incomplete_details")
+            if status == "incomplete":
+                last_reason = (
+                    "裁判API响应不完整："
+                    f"status={status}；incomplete_details={incomplete_details}"
+                )
+                if attempt < self.config.max_retries:
+                    self._retry(last_reason, attempt)
+                    continue
+                raise JudgeError(last_reason)
+            if status not in {None, "completed"} or api_error:
+                raise JudgeError(
+                    "裁判API状态异常："
+                    f"status={status}；error={api_error}；"
+                    f"incomplete_details={incomplete_details}"
+                )
+            return payload
+
+        if last_error is not None:
+            raise JudgeError(last_reason) from last_error
+        raise JudgeError(last_reason)
 
 
 def _clip_prompt(clip: dict[str, Any]) -> str:
@@ -438,6 +503,9 @@ def run_vlm_evaluation(
             "model": config.model,
             "reasoning_effort": config.reasoning_effort,
             "repeats": config.repeats,
+            "max_output_tokens": config.max_output_tokens,
+            "max_retries": config.max_retries,
+            "retry_backoff_s": config.retry_backoff_s,
             "clip_frame_protocol": "2 context before + 12 clip + 2 context after when budget=16",
             "boundary_frame_count": config.boundary_frame_count,
             "blind_method_identity": True,
@@ -481,6 +549,15 @@ def config_from_args(args: Any) -> JudgeConfig:
     repeats = int(getattr(args, "judge_repeats", 1))
     if repeats <= 0:
         raise ValueError("--judge-repeats必须大于0")
+    max_output_tokens = int(getattr(args, "judge_max_output_tokens", 2048))
+    if max_output_tokens <= 0:
+        raise ValueError("--judge-max-output-tokens必须大于0")
+    max_retries = int(getattr(args, "judge_max_retries", 2))
+    if max_retries < 0:
+        raise ValueError("--judge-max-retries不能为负数")
+    retry_backoff_s = float(getattr(args, "judge_retry_backoff_s", 2.0))
+    if retry_backoff_s < 0:
+        raise ValueError("--judge-retry-backoff-s不能为负数")
     return JudgeConfig(
         api_base=str(api_base), api_key=str(key), model=str(model),
         reasoning_effort=str(getattr(args, "judge_reasoning_effort", "high")),
@@ -491,4 +568,7 @@ def config_from_args(args: Any) -> JudgeConfig:
         context_s=float(getattr(args, "vlm_context_s", 0.75)),
         boundary_frame_count=int(getattr(args, "judge_boundary_frame_count", 8)),
         max_pair_gap_s=float(getattr(args, "judge_max_pair_gap_s", 0.25)),
+        max_output_tokens=max_output_tokens,
+        max_retries=max_retries,
+        retry_backoff_s=retry_backoff_s,
     )

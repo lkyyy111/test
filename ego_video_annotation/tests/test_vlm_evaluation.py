@@ -18,6 +18,7 @@ from egoanno.vlm_evaluation import (  # noqa: E402
     CLIP_SCHEMA,
     CLIP_SCORE_KEYS,
     JudgeConfig,
+    JudgeError,
     ResponsesJudge,
     aggregate_metrics,
     config_from_args,
@@ -79,6 +80,26 @@ class FakeSession:
         return FakeResponse()
 
 
+class IncompleteResponse(FakeResponse):
+    def json(self) -> dict:
+        return {
+            "status": "incomplete",
+            "error": None,
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [],
+        }
+
+
+class SequenceSession(FakeSession):
+    def __init__(self, responses: list[FakeResponse]) -> None:
+        super().__init__()
+        self.responses = responses
+
+    def post(self, url: str, **kwargs: object) -> FakeResponse:
+        self.calls.append({"url": url, **kwargs})
+        return self.responses.pop(0)
+
+
 class ResponsesJudgeTests(unittest.TestCase):
     def test_multimodal_responses_request_uses_independent_model_and_schema(self) -> None:
         session = FakeSession()
@@ -103,9 +124,40 @@ class ResponsesJudgeTests(unittest.TestCase):
         body = call["json"]
         self.assertEqual(body["model"], "gpt-5.4-mini")
         self.assertEqual(body["reasoning"]["effort"], "high")
+        self.assertEqual(body["max_output_tokens"], 2048)
         self.assertTrue(body["text"]["format"]["strict"])
         types = [item["type"] for item in body["input"][0]["content"]]
         self.assertIn("input_image", types)
+
+    def test_incomplete_response_is_retried_and_can_recover(self) -> None:
+        session = SequenceSession([IncompleteResponse(), FakeResponse()])
+        config = JudgeConfig(
+            api_base="https://example.test/api/v1", api_key="secret",
+            model="gpt-5.4-mini", max_retries=2, retry_backoff_s=0,
+        )
+        frame = np.zeros((12, 16, 3), dtype=np.uint8)
+
+        result = ResponsesJudge(config, session=session).score(
+            "judge", [("[CLIP_FRAME]", frame)],
+            "ego_clip_evaluation", CLIP_SCHEMA, CLIP_SCORE_KEYS,
+        )
+
+        self.assertEqual(result["atomicity"], 4)
+        self.assertEqual(len(session.calls), 2)
+
+    def test_final_incomplete_error_preserves_details(self) -> None:
+        session = SequenceSession([IncompleteResponse()])
+        config = JudgeConfig(
+            api_base="https://example.test/api/v1", api_key="secret",
+            model="gpt-5.4-mini", max_retries=0, retry_backoff_s=0,
+        )
+        frame = np.zeros((12, 16, 3), dtype=np.uint8)
+
+        with self.assertRaisesRegex(JudgeError, "max_output_tokens"):
+            ResponsesJudge(config, session=session).score(
+                "judge", [("[CLIP_FRAME]", frame)],
+                "ego_clip_evaluation", CLIP_SCHEMA, CLIP_SCORE_KEYS,
+            )
 
     def test_judge_configuration_can_reuse_caption_api_key(self) -> None:
         args = Namespace(
@@ -126,6 +178,8 @@ class ResponsesJudgeTests(unittest.TestCase):
         self.assertEqual(config.api_key, "shared-key")
         self.assertEqual(config.model, "gpt-5.4-mini")
         self.assertEqual(config.repeats, 3)
+        self.assertEqual(config.max_output_tokens, 2048)
+        self.assertEqual(config.max_retries, 2)
 
 
 if __name__ == "__main__":

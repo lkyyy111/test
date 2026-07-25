@@ -119,7 +119,7 @@ python run_pipeline.py \
   --judge-model "$JUDGE_MODEL"
 ```
 
-默认每项只评一次，适合快速实验。正式对比可添加 `--judge-repeats 3`，对每个片段和边界独立评测三次并逐项取中位数，但 API 调用量和耗时约变为三倍。裁判对片段沿用标注阶段相同的最多 16 帧协议（前文 2 + 片段内 12 + 后文 2），对相邻边界默认读取前后各 4 帧。
+默认每项只评一次，适合快速实验。正式对比可添加 `--judge-repeats 3`，对每个片段和边界独立评测三次并逐项取中位数，但 API 调用量和耗时约变为三倍。裁判对片段沿用标注阶段相同的最多 16 帧协议（前文 2 + 片段内 12 + 后文 2），对相邻边界默认读取前后各 4 帧。裁判默认使用 `medium` 推理强度和 2048 个最大输出 token；遇到 `incomplete`、HTTP 429/5xx 或代理连接异常时最多额外重试 2 次，并把最终的 `incomplete_details` 写入失败原因。可通过 `--judge-max-output-tokens`、`--judge-max-retries` 和 `--judge-retry-backoff-s` 调整。
 
 终端会直接打印四项 0–100 分：
 

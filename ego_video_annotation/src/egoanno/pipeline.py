@@ -2143,8 +2143,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="独立评测模型名称；默认读取 JUDGE_MODEL，推荐 gpt-5.4-mini",
     )
     parser.add_argument(
-        "--judge-reasoning-effort", choices=("none", "low", "medium", "high"), default="high",
-        help="裁判模型推理强度，默认 high",
+        "--judge-reasoning-effort", choices=("none", "low", "medium", "high"), default="medium",
+        help="裁判模型推理强度，默认 medium，减少多图请求的不完整响应",
     )
     parser.add_argument(
         "--judge-repeats", type=int, default=1,
@@ -2153,6 +2153,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--judge-timeout-s", type=float, default=180.0,
         help="单次裁判 API 请求超时，默认 180 秒",
+    )
+    parser.add_argument(
+        "--judge-max-output-tokens", type=int, default=2048,
+        help="裁判 Responses 请求的最大输出 token，默认 2048",
+    )
+    parser.add_argument(
+        "--judge-max-retries", type=int, default=2,
+        help="incomplete、HTTP 429/5xx 或连接异常后的额外重试次数，默认 2",
+    )
+    parser.add_argument(
+        "--judge-retry-backoff-s", type=float, default=2.0,
+        help="裁判重试初始等待秒数，之后指数退避，默认 2 秒",
     )
     parser.add_argument(
         "--judge-boundary-frame-count", type=int, default=8,
