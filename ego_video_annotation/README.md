@@ -101,6 +101,35 @@ python run_pipeline.py \
   --skip-video-outputs
 ```
 
+### 同一次运行自动评测
+
+标注模型与裁判模型分开设置。Qwen 继续生成标注，`gpt-5.4-mini` 通过 Responses API 只负责盲评最终结果；`JUDGE_API_KEY` 未单独设置时会复用 `VLM_API_KEY`。
+
+```bash
+export VLM_API_BASE="https://www.autodl.art/api/v1"
+export VLM_MODEL="qwen3-vl-plus"
+export JUDGE_MODEL="gpt-5.4-mini"
+
+python run_pipeline.py \
+  --video ../data/long1.mp4 \
+  --output outputs/long1_eval \
+  --vlm-api-base "$VLM_API_BASE" \
+  --vlm-model "$VLM_MODEL" \
+  --evaluate-vlm \
+  --judge-model "$JUDGE_MODEL"
+```
+
+默认每项只评一次，适合快速实验。正式对比可添加 `--judge-repeats 3`，对每个片段和边界独立评测三次并逐项取中位数，但 API 调用量和耗时约变为三倍。裁判对片段沿用标注阶段相同的最多 16 帧协议（前文 2 + 片段内 12 + 后文 2），对相邻边界默认读取前后各 4 帧。
+
+终端会直接打印四项 0–100 分：
+
+- `SQ`（Segmentation Quality）：边界有效性、片段原子性和动作完整性的平均分；片段项按时长加权。
+- `CF`（Caption Factuality）：`0.15×手别 + 0.35×动作 + 0.25×物体 + 0.25×方向/状态变化`。
+- `TSC`（Temporal Semantic Consistency）：相邻片段在物体状态、动作方向和时间顺序上的连贯性。
+- `EgoSegCap`：`0.4×SQ + 0.4×CF + 0.2×TSC`。
+
+详细逐片段分数、逐边界分数、证据和失败调用写入 `vlm_evaluation.json`。这些是独立 VLM 裁判分，不等同于人工真值准确率；三种对比方法必须固定同一个裁判模型、prompt、帧采样、推理强度和重复次数。裁判调用失败不会删除已经完成的标注产物，而会记录 `N/A` 和错误原因。
+
 ## 输出
 
 - `annotations.json`：面向训练/交付的紧凑细粒度标注。保留手部有效、VLM 成功且动作有意义的片段；`quality_status` 为 `accepted` 或 `review`，后者同时保留 `review_reasons`，不会再因需要复核而整段丢失。文件包含时间、视频路径、caption、动作、物体、左右手信息、质量分数及 `hand_landmarks.json` 采样范围。
@@ -109,6 +138,7 @@ python run_pipeline.py \
 - `wrist_trajectories.csv`：每个采样时刻固定输出左右手各一行；缺失手的真实坐标为空，并另外记录边界专用掌心、`motion_source`、权重和插值 mask。
 - `annotated_video.mp4`：保持原视频时间轴，根据 `annotations.json` 的 `[start_s, end_s)` 在对应区间显示中文caption；`review`片段使用“待复核”标记。当前不再生成骨架overlay视频。
 - `valid_segments/`：按最终细粒度片段导出的有效操作视频。
+- `vlm_evaluation.json`：仅在使用 `--evaluate-vlm` 时生成，包含 SQ、CF、TSC、EgoSegCap、各子项得分、逐片段/边界证据及评测覆盖率。
 
 相邻片段使用半开时间区间 `[start_s, end_s)`，因此不会再因为最后一个采样时间而固定漏掉一段视频。
 `annotations.json` 中的 `sample_range.end` 是包含式索引；使用 `--skip-video-outputs` 时不会生成片段视频，对应 `clip_path` 为 `null`。

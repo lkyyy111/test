@@ -1957,6 +1957,57 @@ def run(args: argparse.Namespace) -> None:
                 f"IK RMSE={retarget_metrics['ik']['position_rmse_m']:.4f}m；"
                 f"仿真 RMSE={retarget_metrics['simulation']['position_rmse_m']:.4f}m"
             )
+    if getattr(args, "evaluate_vlm", False):
+        # The judge is deliberately separate from the Qwen caption model.  A
+        # failed judge call must not erase or invalidate the annotation files
+        # that have already been produced by the main pipeline.
+        from egoanno.vlm_evaluation import config_from_args, run_vlm_evaluation
+
+        evaluation_path = output / "vlm_evaluation.json"
+        print("[info] 使用独立 VLM 裁判评测最终片段与相邻边界…")
+        try:
+            judge_config = config_from_args(args)
+            evaluation = run_vlm_evaluation(
+                info, clean_annotations, judge_config, sample_segment_frames,
+            )
+            evaluation_path.write_text(
+                json.dumps(evaluation, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+            scores = evaluation["metrics"]
+            score_text = " | ".join(
+                f"{label}={scores[key]:.2f}" if scores[key] is not None else f"{label}=N/A"
+                for label, key in (
+                    ("SQ", "segmentation_quality"),
+                    ("CF", "caption_factuality"),
+                    ("TSC", "temporal_semantic_consistency"),
+                    ("EgoSegCap", "ego_seg_cap"),
+                )
+            )
+            counts = evaluation["counts"]
+            print(f"[eval] {score_text}")
+            print(
+                "[eval] 覆盖："
+                f"片段 {counts['evaluated_clips']}/{counts['input_clips']}；"
+                f"边界 {counts['evaluated_boundaries']}/{counts['contiguous_boundaries']}；"
+                f"失败调用 {counts['failed_calls']}；详情：{evaluation_path}"
+            )
+        except Exception as error:
+            failure = {
+                "schema_version": "1.0",
+                "status": "failed",
+                "error": str(error),
+                "metrics": {
+                    "segmentation_quality": None,
+                    "caption_factuality": None,
+                    "temporal_semantic_consistency": None,
+                    "ego_seg_cap": None,
+                },
+            }
+            evaluation_path.write_text(
+                json.dumps(failure, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+            print(f"[warning] VLM 自动评测失败：{error}；标注输出不受影响。")
+            print(f"[eval] SQ=N/A | CF=N/A | TSC=N/A | EgoSegCap=N/A；详情：{evaluation_path}")
     print(
         f"[done] 最终细片段：{len(fine)}；标注输出：{len(clean_annotations['clips'])}；"
         f"有效视频：{len(valid_ids)}；待复核：{len(review_queue)}；结果目录：{output}"
@@ -1997,6 +2048,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vlm-image-max-side", type=int, default=768, help="发送给VLM前的图像最长边，默认 768")
     parser.add_argument("--vlm-api-base", default=None, help="兼容 Chat Completions 的 API 基地址")
     parser.add_argument("--vlm-model", default=None, help="视觉语言模型名称；密钥从 VLM_API_KEY 读取")
+    parser.add_argument(
+        "--evaluate-vlm", action="store_true",
+        help="标注完成后使用独立 Responses API 视觉模型计算 SQ、CF、TSC 与 EgoSegCap",
+    )
+    parser.add_argument(
+        "--judge-api-base", default=None,
+        help="评测模型 API 基地址；默认依次使用 JUDGE_API_BASE、--vlm-api-base、VLM_API_BASE",
+    )
+    parser.add_argument(
+        "--judge-model", default=None,
+        help="独立评测模型名称；默认读取 JUDGE_MODEL，推荐 gpt-5.4-mini",
+    )
+    parser.add_argument(
+        "--judge-reasoning-effort", choices=("none", "low", "medium", "high"), default="high",
+        help="裁判模型推理强度，默认 high",
+    )
+    parser.add_argument(
+        "--judge-repeats", type=int, default=1,
+        help="每个片段和边界重复评测次数并取中位数；快速实验用 1，正式实验建议 3",
+    )
+    parser.add_argument(
+        "--judge-timeout-s", type=float, default=180.0,
+        help="单次裁判 API 请求超时，默认 180 秒",
+    )
+    parser.add_argument(
+        "--judge-boundary-frame-count", type=int, default=8,
+        help="相邻片段边界评测的总帧数，默认前后各 4 帧",
+    )
+    parser.add_argument(
+        "--judge-max-pair-gap-s", type=float, default=0.25,
+        help="视为相邻动作边界的最大时间间隙，默认 0.25 秒",
+    )
     parser.add_argument("--review-confidence", type=float, default=0.65, help="低于该VLM置信度的有效片段进入复核队列")
     parser.add_argument("--skip-video-outputs", action="store_true", help="仅输出 JSON/CSV，不生成 MP4")
     parser.add_argument(
