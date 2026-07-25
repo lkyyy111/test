@@ -1898,46 +1898,46 @@ def run(args: argparse.Namespace) -> None:
         )
         print("[info] 按最终细粒度边界导出有效操作片段…")
         write_valid_clips(info, fine, output / "valid_segments")
-    if getattr(args, "retarget_dex_hand", False):
-        # Keep MuJoCo optional. Long-video annotation runs are unchanged when
-        # the explicit dexterous-hand switch is absent.
-        from egoanno.retarget_dexhand import combine_retarget_videos, run_dex_hand_retarget
+    if getattr(args, "retarget_franka", False):
+        # Lazy import keeps MuJoCo and the Franka model optional. Long-video
+        # annotation runs are unchanged when --retarget-franka is absent.
+        from egoanno.retarget_franka import combine_retarget_videos, run_franka_retarget
 
-        retarget_root = output / "dex_hand_retarget"
+        retarget_root = output / "franka_retarget"
         if args.retarget_hand == "both":
             metrics_by_hand: dict[str, Any] = {}
             for side in HAND_SIDES:
-                print(f"[info] 将整段 {side} 手的21点姿态映射到独立五指灵巧手…")
+                print(f"[info] 将整段 {side} 手轨迹映射到独立 Franka…")
                 side_args = argparse.Namespace(**vars(args))
                 side_args.retarget_hand = side
-                metrics = run_dex_hand_retarget(
+                metrics = run_franka_retarget(
                     info, samples, retarget_root / side, side_args,
                 )
                 metrics_by_hand[side] = metrics
                 print(
-                    f"[info] {side} 灵巧手完成："
-                    f"观测覆盖率={metrics['observed_coverage']:.1%}；"
-                    f"受支持控制点={metrics['supported_control_ratio']:.1%}"
+                    f"[info] {side} Franka 完成："
+                    f"IK RMSE={metrics['ik']['position_rmse_m']:.4f}m；"
+                    f"仿真 RMSE={metrics['simulation']['position_rmse_m']:.4f}m"
                 )
             combined_video = None
             combined_video_info = None
             if not args.skip_video_outputs:
                 combined_video = "retarget_both.mp4"
-                print("[info] 合成同步双手第一人称灵巧手视频…")
+                print("[info] 合成同步双手 Franka 并排视频…")
                 combined_video_info = combine_retarget_videos(
                     retarget_root / "left" / "retarget.mp4",
                     retarget_root / "right" / "retarget.mp4",
                     retarget_root / combined_video,
                 )
             summary = {
-                "schema_version": "1.0",
-                "profile": "short_bimanual_two_independent_dexterous_hands",
+                "schema_version": "0.1",
+                "profile": "short_bimanual_two_independent_frankas",
                 "source_video": str(info.path),
                 "hands": list(HAND_SIDES),
                 "shared_timebase": True,
                 "spatial_mapping": (
-                    "Each hand is normalized independently into its own first-person dex-hand view; "
-                    "timing is synchronized, but inter-hand metric distance and contact are not modeled."
+                    "Each hand is normalized independently into its own Franka vertical plane; "
+                    "timing is synchronized, but inter-hand metric distance and collisions are not modeled."
                 ),
                 "results": metrics_by_hand,
                 "rendered_video": combined_video,
@@ -1948,14 +1948,14 @@ def run(args: argparse.Namespace) -> None:
                 json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8",
             )
         else:
-            print(f"[info] 将整段 {args.retarget_hand} 手的21点姿态映射到五指灵巧手…")
-            retarget_metrics = run_dex_hand_retarget(
+            print(f"[info] 将整段 {args.retarget_hand} 手轨迹映射到 Franka…")
+            retarget_metrics = run_franka_retarget(
                 info, samples, retarget_root, args,
             )
             print(
-                "[info] 灵巧手 retarget 完成："
-                f"观测覆盖率={retarget_metrics['observed_coverage']:.1%}；"
-                f"受支持控制点={retarget_metrics['supported_control_ratio']:.1%}"
+                "[info] Franka retarget 完成："
+                f"IK RMSE={retarget_metrics['ik']['position_rmse_m']:.4f}m；"
+                f"仿真 RMSE={retarget_metrics['simulation']['position_rmse_m']:.4f}m"
             )
     print(
         f"[done] 最终细片段：{len(fine)}；标注输出：{len(clean_annotations['clips'])}；"
@@ -2008,36 +2008,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="字幕字号；0 表示根据视频高度自动选择",
     )
     parser.add_argument(
-        "--retarget-dex-hand", "--retarget-franka",
-        dest="retarget_dex_hand", action="store_true",
-        help=(
-            "可选：将整段单手或双手的21点姿态映射到第一人称MuJoCo五指灵巧手；"
-            "默认关闭，不影响long1。--retarget-franka仅作为旧命令兼容别名"
-        ),
+        "--retarget-franka", action="store_true",
+        help="可选：将整段单手或双手轨迹映射到 MuJoCo Franka；默认关闭，不影响 long1",
     )
     parser.add_argument(
         "--retarget-hand", choices=("left", "right", "both"), default="right",
-        help="重定向的操作手；short1使用right，short2使用both",
+        help="Franka 跟随的操作手；short1 使用 right，short2 使用 both",
     )
     parser.add_argument(
         "--retarget-control-fps", type=float, default=50.0,
-        help="灵巧手姿态与根轨迹的重采样频率，默认50 Hz",
+        help="Franka 目标轨迹与控制频率，默认 50 Hz",
     )
     parser.add_argument(
         "--retarget-gap-tolerance", type=float, default=0.5,
         help="retarget 允许插值的短暂丢手上限；长缺失保持上一目标",
     )
     parser.add_argument(
-        "--dex-hand-forward-range", type=float, default=0.18,
-        help="由手掌画面尺度估计的向前伸出范围（米），默认0.18",
+        "--retarget-robot-x", type=float, default=0.50,
+        help="short 单手竖直平面距 Franka 基座的前向位置（米）",
     )
     parser.add_argument(
-        "--dex-hand-lateral-range", type=float, default=0.12,
-        help="腕部画面横向映射到灵巧手左右移动的半范围（米），默认0.12",
+        "--retarget-y-range", type=float, default=0.10,
+        help="人体图像横向轨迹映射到 Franka 左右方向的半范围（米）",
     )
     parser.add_argument(
-        "--dex-hand-vertical-range", type=float, default=0.10,
-        help="腕部画面纵向映射到灵巧手上下移动的半范围（米），默认0.10",
+        "--retarget-z-low", type=float, default=0.25,
+        help="short 抬放动作映射的最低末端高度（米）",
+    )
+    parser.add_argument(
+        "--retarget-z-high", type=float, default=0.50,
+        help="short 抬放动作映射的最高末端高度（米）",
+    )
+    parser.add_argument(
+        "--franka-model", default=None,
+        help="可选 Franka scene.xml/panda.xml；默认尝试 robot_descriptions 或 MUJOCO_MENAGERIE_PATH",
     )
     return parser
 
