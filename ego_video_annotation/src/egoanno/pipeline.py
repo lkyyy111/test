@@ -1787,45 +1787,92 @@ def run(args: argparse.Namespace) -> None:
         if len(samples) > 1 else args.sample_fps
     )
 
-    velocity_candidates = find_velocity_candidates(samples, args)
-    technical_candidates = _long_no_hand_boundaries(
-        samples, args.max_no_hand_gap_s, info.duration_s,
-    )
-    candidates = consolidate_boundaries(
-        velocity_candidates + technical_candidates,
-        min(args.velocity_min_gap_s, args.max_no_hand_gap_s / 2),
-    )
-    candidates = _add_analysis_windows(samples, candidates, args.max_provisional_segment_s)
-    candidates = consolidate_boundaries(candidates, args.minimum_provisional_duration_s)
-    boundary_by_index = {item["index"]: item for item in candidates}
-    provisional_spans = spans_from_boundaries(candidates, len(samples))
-    initial_provisional = [
-        segment_record(span, samples, index + 1, "candidate_fine", info.duration_s, args)
-        for index, span in enumerate(provisional_spans)
-    ]
-    print(f"[info] 腕速候选边界 {len(velocity_candidates)} 个；待描述候选细片段 {len(initial_provisional)} 个…")
+    segmentation_method = getattr(args, "segmentation_method", "ours")
+    sam_diagnostics: dict[str, Any] | None = None
+    if segmentation_method == "sam":
+        if args.sam_action_count is None:
+            raise ValueError(
+                "SaM 原算法需要已知不同动作类别数 K；请设置 --sam-action-count K"
+            )
+        from egoanno.sam_segmentation import segment_video_with_sam
 
-    for segment in tqdm(initial_provisional, desc="VLM细粒度标注", unit="clip"):
-        annotate_candidate_segment(segment, info, args)
-
-    provisional, refinement_boundaries, refined_parent_count = refine_multi_action_segments(
-        initial_provisional, samples, info, args,
-    )
-    if refinement_boundaries:
-        for boundary in refinement_boundaries:
-            boundary_by_index[boundary["index"]] = boundary
-        candidates = sorted(boundary_by_index.values(), key=lambda item: item["time_s"])
-        print(
-            f"[info] VLM 多动作补切 {refined_parent_count} 个父片段，"
-            f"新增 {len(refinement_boundaries)} 个候选边界；重新描述后共 {len(provisional)} 个候选细片段。"
+        sam_result = segment_video_with_sam(
+            info, samples, args.sam_action_count, args.sam_delta,
+            args.sam_lambda, args.sam_feature_file,
         )
+        sam_diagnostics = sam_result["diagnostics"]
+        candidates = []
+        for boundary in sam_result["boundaries"]:
+            index = int(boundary["index"])
+            candidates.append({
+                **boundary,
+                "time_s": round(float(samples[index]["time_s"]), 3),
+            })
+        boundary_by_index = {item["index"]: item for item in candidates}
+        velocity_candidates: list[dict[str, Any]] = []
+        refinement_boundaries: list[dict[str, Any]] = []
+        removed_boundaries: list[dict[str, Any]] = []
+        refined_parent_count = 0
+        merged_recaption_count = 0
+        merged_recaption_success_count = 0
+        fine = []
+        for index, run_record in enumerate(sam_result["runs"], 1):
+            segment = segment_record(
+                (int(run_record["start"]), int(run_record["end"])),
+                samples, index, "fine", info.duration_s, args,
+            )
+            segment["sam_cluster_id"] = int(run_record["cluster_id"])
+            segment["segmentation_method"] = "sam_split_merge_no_vlm_boundary_refinement"
+            fine.append(segment)
+        initial_provisional = fine
+        provisional = fine
+        print(
+            f"[info] SaM：{sam_diagnostics['initial_actom_count']} 个初始 actom "
+            f"合并为 {sam_diagnostics['final_distinct_cluster_count']} 个动作类，"
+            f"得到 {len(fine)} 个连续片段；按相同 2+12+2 条件生成 Caption…"
+        )
+        for segment in tqdm(fine, desc="VLM细粒度标注", unit="clip"):
+            annotate_candidate_segment(segment, info, args)
+    else:
+        velocity_candidates = find_velocity_candidates(samples, args)
+        technical_candidates = _long_no_hand_boundaries(
+            samples, args.max_no_hand_gap_s, info.duration_s,
+        )
+        candidates = consolidate_boundaries(
+            velocity_candidates + technical_candidates,
+            min(args.velocity_min_gap_s, args.max_no_hand_gap_s / 2),
+        )
+        candidates = _add_analysis_windows(samples, candidates, args.max_provisional_segment_s)
+        candidates = consolidate_boundaries(candidates, args.minimum_provisional_duration_s)
+        boundary_by_index = {item["index"]: item for item in candidates}
+        provisional_spans = spans_from_boundaries(candidates, len(samples))
+        initial_provisional = [
+            segment_record(span, samples, index + 1, "candidate_fine", info.duration_s, args)
+            for index, span in enumerate(provisional_spans)
+        ]
+        print(f"[info] 腕速候选边界 {len(velocity_candidates)} 个；待描述候选细片段 {len(initial_provisional)} 个…")
 
-    fine, removed_boundaries = merge_fine_segments(
-        provisional, boundary_by_index, samples, info, args,
-    )
-    merged_recaption_count, merged_recaption_success_count = recaption_merged_fine_segments(
-        fine, info, args,
-    )
+        for segment in tqdm(initial_provisional, desc="VLM细粒度标注", unit="clip"):
+            annotate_candidate_segment(segment, info, args)
+
+        provisional, refinement_boundaries, refined_parent_count = refine_multi_action_segments(
+            initial_provisional, samples, info, args,
+        )
+        if refinement_boundaries:
+            for boundary in refinement_boundaries:
+                boundary_by_index[boundary["index"]] = boundary
+            candidates = sorted(boundary_by_index.values(), key=lambda item: item["time_s"])
+            print(
+                f"[info] VLM 多动作补切 {refined_parent_count} 个父片段，"
+                f"新增 {len(refinement_boundaries)} 个候选边界；重新描述后共 {len(provisional)} 个候选细片段。"
+            )
+
+        fine, removed_boundaries = merge_fine_segments(
+            provisional, boundary_by_index, samples, info, args,
+        )
+        merged_recaption_count, merged_recaption_success_count = recaption_merged_fine_segments(
+            fine, info, args,
+        )
     review_queue: list[dict[str, Any]] = []
     for segment in fine:
         if not segment["valid_operation"]:
@@ -1854,7 +1901,12 @@ def run(args: argparse.Namespace) -> None:
         "parameters": vars(args),
         "segmentation": {
             "order": "fine_only",
-            "fine_method": "weighted_interpolated_per_hand_and_global_speed_minima_then_vlm_refine_and_merge",
+            "fine_method": (
+                "sam_split_merge_then_single_pass_caption"
+                if segmentation_method == "sam"
+                else "weighted_interpolated_per_hand_and_global_speed_minima_then_vlm_refine_and_merge"
+            ),
+            "vlm_boundary_refinement_enabled": segmentation_method == "ours",
             "actual_sample_fps": round(actual_sample_fps, 4),
             "velocity_candidate_count": len(velocity_candidates),
             "initial_provisional_fine_count": len(initial_provisional),
@@ -1870,6 +1922,12 @@ def run(args: argparse.Namespace) -> None:
             "merged_recaption_success_count": merged_recaption_success_count,
             "boundary_candidates": candidates,
             "removed_boundaries": removed_boundaries,
+            "sam_summary": (
+                None if sam_diagnostics is None else {
+                    key: value for key, value in sam_diagnostics.items()
+                    if key not in {"adjacent_similarity", "merge_history"}
+                }
+            ),
         },
         "coordinate_system": {
             "image": "MediaPipe x/y normalized to [0,1]; z is relative depth",
@@ -1887,6 +1945,10 @@ def run(args: argparse.Namespace) -> None:
     (output / "annotations_diagnostics.json").write_text(
         json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8",
     )
+    if sam_diagnostics is not None:
+        (output / "sam_segmentation.json").write_text(
+            json.dumps(sam_diagnostics, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
     (output / "hand_landmarks.json").write_text(json.dumps(samples, ensure_ascii=False, indent=2), encoding="utf-8")
     write_trajectories(samples, output / "wrist_trajectories.csv")
     if not args.skip_video_outputs:
@@ -2018,6 +2080,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="第一视角视频：细粒度切分、语言标注、21点手姿态和轨迹")
     parser.add_argument("--video", required=True, help="输入视频路径")
     parser.add_argument("--output", required=True, help="输出目录")
+    parser.add_argument(
+        "--segmentation-method", choices=("ours", "sam"), default="ours",
+        help="细粒度切分方法；ours 为腕速+VLM边界修正，sam 为 SaM split-and-merge 基线",
+    )
+    parser.add_argument(
+        "--sam-action-count", type=int, default=None,
+        help="SaM 所需的不同动作类别数 K；使用 --segmentation-method sam 时必须显式提供",
+    )
+    parser.add_argument(
+        "--sam-delta", type=float, default=0.3,
+        help="SaM 局部最小值搜索窗口参数 δ，论文默认 0.3",
+    )
+    parser.add_argument(
+        "--sam-lambda", type=float, default=0.001,
+        help="SaM actom 合并的时间一致性权重 λ，论文建议 0.001",
+    )
+    parser.add_argument(
+        "--sam-feature-file", default=None,
+        help="可选：与分析采样帧逐行对齐的 N×D .npy 特征；默认使用 OpenCV HOF+HSV+DCT",
+    )
     parser.add_argument("--sample-fps", type=float, default=8.0, help="手部与运动分析采样帧率，默认 8")
     parser.add_argument("--hand-confidence", type=float, default=0.55, help="MediaPipe 手部检测/跟踪阈值")
     parser.add_argument("--hand-gap-tolerance", type=float, default=0.5, help="仅桥接手部存在状态的短缺失时长，默认 0.5 秒")

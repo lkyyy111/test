@@ -130,6 +130,29 @@ python run_pipeline.py \
 
 详细逐片段分数、逐边界分数、证据和失败调用写入 `vlm_evaluation.json`。这些是独立 VLM 裁判分，不等同于人工真值准确率；三种对比方法必须固定同一个裁判模型、prompt、帧采样、推理强度和重复次数。裁判调用失败不会删除已经完成的标注产物，而会记录 `N/A` 和错误原因。
 
+### SaM split-and-merge 对比基线
+
+`--segmentation-method sam` 启用 [SaM：Unsupervised Action Segmentation via Fast Learning of Semantically Consistent Actoms（AAAI 2024）](https://ojs.aaai.org/index.php/AAAI/article/view/28445) 风格的基线。它按照相邻特征的子空间余弦相似度，在局部窗口中寻找最小值形成初始 actom，再使用论文的时空相似度反复合并 actom。
+
+原论文把视频中的不同动作类别数 `K` 作为输入，因此该模式要求显式设置 `--sam-action-count K`。不能使用我们方法的 VLM 标注反推 `K`，否则会向基线泄漏语义信息。对 long1 固定使用 `K=20` 的示例为：
+
+```bash
+python run_pipeline.py \
+  --video ../data/long1.mp4 \
+  --output outputs/long1_sam \
+  --segmentation-method sam \
+  --sam-action-count 20 \
+  --vlm-api-base "$VLM_API_BASE" \
+  --vlm-model "$VLM_MODEL" \
+  --evaluate-vlm \
+  --judge-model "$JUDGE_MODEL" \
+  2>&1 | tee outputs/long1_sam_run.log
+```
+
+SaM 最终得到的每个连续片段只进行一次与主方法完全相同的 caption：最多 16 帧，即前文 2 帧、片段内 12 帧、后文 2 帧。即使 caption 返回 `contains_multiple_actions=true`，SaM 模式也不会据此补切；相邻 caption 语义相同也不会触发 VLM 合并，合并后的长片段也不会重新描述。
+
+论文在不同数据集上使用预提取 IDT 或 HOF+VGG16 特征。本项目为了直接处理原始 MP4，默认使用无需新增依赖的 OpenCV HOF+HSV+DCT 特征，并严格复用论文的 split-and-merge 公式，因此应在报告中称为 `SaM-inspired + Caption`。若已有与 8 FPS 分析采样逐行对齐的 `N×D` 特征矩阵，可通过 `--sam-feature-file features.npy` 替换默认特征。论文参数默认保持 `--sam-delta 0.3 --sam-lambda 0.001`。
+
 ## 输出
 
 - `annotations.json`：面向训练/交付的紧凑细粒度标注。保留手部有效、VLM 成功且动作有意义的片段；`quality_status` 为 `accepted` 或 `review`，后者同时保留 `review_reasons`，不会再因需要复核而整段丢失。文件包含时间、视频路径、caption、动作、物体、左右手信息、质量分数及 `hand_landmarks.json` 采样范围。
@@ -139,6 +162,7 @@ python run_pipeline.py \
 - `annotated_video.mp4`：保持原视频时间轴，根据 `annotations.json` 的 `[start_s, end_s)` 在对应区间显示中文caption；`review`片段使用“待复核”标记。当前不再生成骨架overlay视频。
 - `valid_segments/`：按最终细粒度片段导出的有效操作视频。
 - `vlm_evaluation.json`：仅在使用 `--evaluate-vlm` 时生成，包含 SQ、CF、TSC、EgoSegCap、各子项得分、逐片段/边界证据及评测覆盖率。
+- `sam_segmentation.json`：仅在 SaM 模式生成，保存特征来源、相似度曲线、初始 actom 边界、合并历史、最终动作类与连续片段数量。
 
 相邻片段使用半开时间区间 `[start_s, end_s)`，因此不会再因为最后一个采样时间而固定漏掉一段视频。
 `annotations.json` 中的 `sample_range.end` 是包含式索引；使用 `--skip-video-outputs` 时不会生成片段视频，对应 `clip_path` 为 `null`。
