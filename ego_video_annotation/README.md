@@ -153,6 +153,29 @@ SaM 最终得到的每个连续片段只进行一次与主方法完全相同的 
 
 论文在不同数据集上使用预提取 IDT 或 HOF+VGG16 特征。本项目为了直接处理原始 MP4，默认使用无需新增依赖的 OpenCV HOF+HSV+DCT 特征，并严格复用论文的 split-and-merge 公式，因此应在报告中称为 `SaM-inspired + Caption`。若已有与 8 FPS 分析采样逐行对齐的 `N×D` 特征矩阵，可通过 `--sam-feature-file features.npy` 替换默认特征。论文参数默认保持 `--sam-delta 0.3 --sam-lambda 0.001`。
 
+### OTAS object-centric boundary 对比基线
+
+`--segmentation-method otas` 启用 [OTAS：Unsupervised Boundary Detection for Object-Centric Temporal Action Segmentation（WACV 2024）](https://openaccess.thecvf.com/content/WACV2024/html/Li_OTAS_Unsupervised_Boundary_Detection_for_Object-Centric_Temporal_Action_Segmentation_WACV_2024_paper.html) 风格的边界基线。它分别计算全局画面、手部附近交互区域和双手几何/姿态关系的时间变化，以全局候选为主，由物体中心候选在邻域内确认或校正；特别强的局部变化也可以独立成为边界。该方法不需要 SaM 的动作类别数 `K`。
+
+对 long1 运行并用相同裁判评测：
+
+```bash
+python run_pipeline.py \
+  --video ../data/long1.mp4 \
+  --output outputs/long1_otas \
+  --segmentation-method otas \
+  --vlm-api-base "$VLM_API_BASE" \
+  --vlm-model "$VLM_MODEL" \
+  --evaluate-vlm \
+  --judge-model "$JUDGE_MODEL" \
+  --judge-reasoning-effort medium \
+  2>&1 | tee outputs/long1_otas_run.log
+```
+
+和 SaM 一样，OTAS 最终片段只做一次相同的 `2+12+2` caption；即使返回多动作提示也不补切，相邻语义一致也不合并，不进行长片段重描述。这样，只有 `ours` 含 VLM 边界修正。
+
+需要特别说明：原论文的三路特征来自在 Breakfast 数据上训练的未来帧预测网络、Detectron2 人—物 mask 和 GAT 物体关系图；官方仓库没有可直接套用到任意 MP4 的完整预训练产物。本项目为保证 long1 可直接运行，以 OpenCV 全局外观、扩大的 MediaPipe 手部邻域及双手几何/姿态作为免训练代理，因此报告中应称为 `OTAS-inspired + Caption`，不能声称是官方模型的严格复现。若后续提取到真正的三路特征，可用 `--otas-feature-file features.npz` 输入逐采样帧对齐的 `global`、`interaction`、`relation` 三个 `N×D` 数组。
+
 ## 输出
 
 - `annotations.json`：面向训练/交付的紧凑细粒度标注。保留手部有效、VLM 成功且动作有意义的片段；`quality_status` 为 `accepted` 或 `review`，后者同时保留 `review_reasons`，不会再因需要复核而整段丢失。文件包含时间、视频路径、caption、动作、物体、左右手信息、质量分数及 `hand_landmarks.json` 采样范围。
@@ -163,6 +186,7 @@ SaM 最终得到的每个连续片段只进行一次与主方法完全相同的 
 - `valid_segments/`：按最终细粒度片段导出的有效操作视频。
 - `vlm_evaluation.json`：仅在使用 `--evaluate-vlm` 时生成，包含 SQ、CF、TSC、EgoSegCap、各子项得分、逐片段/边界证据及评测覆盖率。
 - `sam_segmentation.json`：仅在 SaM 模式生成，保存特征来源、相似度曲线、初始 actom 边界、合并历史、最终动作类与连续片段数量。
+- `otas_segmentation.json`：仅在 OTAS 模式生成，保存三路特征来源、时间差分曲线、各路候选峰、融合分数和最终边界。
 
 相邻片段使用半开时间区间 `[start_s, end_s)`，因此不会再因为最后一个采样时间而固定漏掉一段视频。
 `annotations.json` 中的 `sample_range.end` 是包含式索引；使用 `--skip-video-outputs` 时不会生成片段视频，对应 `clip_path` 为 `null`。

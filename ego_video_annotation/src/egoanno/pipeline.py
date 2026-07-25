@@ -1789,6 +1789,7 @@ def run(args: argparse.Namespace) -> None:
 
     segmentation_method = getattr(args, "segmentation_method", "ours")
     sam_diagnostics: dict[str, Any] | None = None
+    otas_diagnostics: dict[str, Any] | None = None
     if segmentation_method == "sam":
         if args.sam_action_count is None:
             raise ValueError(
@@ -1830,6 +1831,51 @@ def run(args: argparse.Namespace) -> None:
             f"[info] SaM：{sam_diagnostics['initial_actom_count']} 个初始 actom "
             f"合并为 {sam_diagnostics['final_distinct_cluster_count']} 个动作类，"
             f"得到 {len(fine)} 个连续片段；按相同 2+12+2 条件生成 Caption…"
+        )
+        for segment in tqdm(fine, desc="VLM细粒度标注", unit="clip"):
+            annotate_candidate_segment(segment, info, args)
+    elif segmentation_method == "otas":
+        from egoanno.otas_segmentation import segment_video_with_otas
+
+        otas_result = segment_video_with_otas(
+            info, samples, args.otas_feature_file,
+            args.otas_global_weight, args.otas_interaction_weight,
+            args.otas_relation_weight, args.otas_peak_window_s,
+            args.otas_neighbor_s, args.otas_min_gap_s,
+            args.otas_candidate_threshold, args.otas_strong_local_threshold,
+            args.otas_smoothing_s,
+        )
+        otas_diagnostics = otas_result["diagnostics"]
+        candidates = []
+        for boundary in otas_result["boundaries"]:
+            index = int(boundary["index"])
+            candidates.append({
+                **boundary,
+                "time_s": round(float(samples[index]["time_s"]), 3),
+            })
+        boundary_by_index = {item["index"]: item for item in candidates}
+        velocity_candidates = []
+        refinement_boundaries = []
+        removed_boundaries = []
+        refined_parent_count = 0
+        merged_recaption_count = 0
+        merged_recaption_success_count = 0
+        fine = []
+        for index, run_record in enumerate(otas_result["runs"], 1):
+            segment = segment_record(
+                (int(run_record["start"]), int(run_record["end"])),
+                samples, index, "fine", info.duration_s, args,
+            )
+            segment["segmentation_method"] = (
+                "otas_object_centric_boundary_no_vlm_boundary_refinement"
+            )
+            fine.append(segment)
+        initial_provisional = fine
+        provisional = fine
+        print(
+            f"[info] OTAS-inspired：三路特征产生 {len(candidates)} 个边界，"
+            f"得到 {len(fine)} 个片段；按相同 2+12+2 条件生成 Caption，"
+            "不执行 VLM 合并或补切…"
         )
         for segment in tqdm(fine, desc="VLM细粒度标注", unit="clip"):
             annotate_candidate_segment(segment, info, args)
@@ -1904,7 +1950,11 @@ def run(args: argparse.Namespace) -> None:
             "fine_method": (
                 "sam_split_merge_then_single_pass_caption"
                 if segmentation_method == "sam"
-                else "weighted_interpolated_per_hand_and_global_speed_minima_then_vlm_refine_and_merge"
+                else (
+                    "otas_three_stream_boundary_fusion_then_single_pass_caption"
+                    if segmentation_method == "otas"
+                    else "weighted_interpolated_per_hand_and_global_speed_minima_then_vlm_refine_and_merge"
+                )
             ),
             "vlm_boundary_refinement_enabled": segmentation_method == "ours",
             "actual_sample_fps": round(actual_sample_fps, 4),
@@ -1928,6 +1978,12 @@ def run(args: argparse.Namespace) -> None:
                     if key not in {"adjacent_similarity", "merge_history"}
                 }
             ),
+            "otas_summary": (
+                None if otas_diagnostics is None else {
+                    key: value for key, value in otas_diagnostics.items()
+                    if key not in {"temporal_difference_curves", "fused_curve"}
+                }
+            ),
         },
         "coordinate_system": {
             "image": "MediaPipe x/y normalized to [0,1]; z is relative depth",
@@ -1948,6 +2004,10 @@ def run(args: argparse.Namespace) -> None:
     if sam_diagnostics is not None:
         (output / "sam_segmentation.json").write_text(
             json.dumps(sam_diagnostics, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+    if otas_diagnostics is not None:
+        (output / "otas_segmentation.json").write_text(
+            json.dumps(otas_diagnostics, ensure_ascii=False, indent=2), encoding="utf-8",
         )
     (output / "hand_landmarks.json").write_text(json.dumps(samples, ensure_ascii=False, indent=2), encoding="utf-8")
     write_trajectories(samples, output / "wrist_trajectories.csv")
@@ -2081,8 +2141,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video", required=True, help="输入视频路径")
     parser.add_argument("--output", required=True, help="输出目录")
     parser.add_argument(
-        "--segmentation-method", choices=("ours", "sam"), default="ours",
-        help="细粒度切分方法；ours 为腕速+VLM边界修正，sam 为 SaM split-and-merge 基线",
+        "--segmentation-method", choices=("ours", "sam", "otas"), default="ours",
+        help=(
+            "细粒度切分方法；ours 为腕速+VLM边界修正，sam 为 SaM split-and-merge "
+            "基线，otas 为三路物体中心边界融合基线"
+        ),
     )
     parser.add_argument(
         "--sam-action-count", type=int, default=None,
@@ -2099,6 +2162,49 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sam-feature-file", default=None,
         help="可选：与分析采样帧逐行对齐的 N×D .npy 特征；默认使用 OpenCV HOF+HSV+DCT",
+    )
+    parser.add_argument(
+        "--otas-feature-file", default=None,
+        help=(
+            "可选：含 global、interaction、relation 三个 N×D 数组的 .npz；"
+            "默认使用免训练 OpenCV+MediaPipe 代理特征"
+        ),
+    )
+    parser.add_argument(
+        "--otas-global-weight", type=float, default=1.0,
+        help="OTAS 全局视觉变化权重，默认 1",
+    )
+    parser.add_argument(
+        "--otas-interaction-weight", type=float, default=1.0,
+        help="OTAS 手部邻域交互变化权重，默认 1",
+    )
+    parser.add_argument(
+        "--otas-relation-weight", type=float, default=1.0,
+        help="OTAS 双手几何/姿态关系变化权重，默认 1",
+    )
+    parser.add_argument(
+        "--otas-peak-window-s", type=float, default=0.75,
+        help="OTAS 各路局部极大值的半窗口，默认 0.75 秒",
+    )
+    parser.add_argument(
+        "--otas-neighbor-s", type=float, default=0.75,
+        help="OTAS 局部候选确认或校正全局候选的邻域，默认 0.75 秒",
+    )
+    parser.add_argument(
+        "--otas-min-gap-s", type=float, default=0.75,
+        help="OTAS 最终边界最短间隔，默认 0.75 秒",
+    )
+    parser.add_argument(
+        "--otas-candidate-threshold", type=float, default=1.0,
+        help="OTAS 单路候选阈值（相对该路平均变化），默认 1.0",
+    )
+    parser.add_argument(
+        "--otas-strong-local-threshold", type=float, default=2.5,
+        help="无完整三路支持时保留强候选的融合分数阈值，默认 2.5",
+    )
+    parser.add_argument(
+        "--otas-smoothing-s", type=float, default=0.25,
+        help="OTAS 时间差分曲线平滑半径，默认 0.25 秒",
     )
     parser.add_argument("--sample-fps", type=float, default=8.0, help="手部与运动分析采样帧率，默认 8")
     parser.add_argument("--hand-confidence", type=float, default=0.55, help="MediaPipe 手部检测/跟踪阈值")
